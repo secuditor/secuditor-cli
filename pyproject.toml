@@ -1,0 +1,51 @@
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "secuditor"
+version = "0.1.0"
+description = "A cross-platform Python library for security diagnostics, network discovery, and auditing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Menahem Levinski" },
+]
+keywords = [
+    "security",
+    "cybersecurity",
+    "auditing",
+    "network-discovery",
+    "port-scanning",
+    "system-diagnostics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/secuditor/secuditor"
+Repository = "https://github.com/secuditor/secuditor"
+Issues = "https://github.com/secuditor/secuditor/issues"
+
+[tool.setuptools.packages.find]
+include = ["secuditor*"]
