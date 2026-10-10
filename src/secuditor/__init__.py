@@ -4,16 +4,6 @@
 
 __version__ = "0.2.0"
 
-from .domain_settings import DomainAudit
-from .endpoint_security import SecurityAudit
-from .installed_apps import InstalledApps
-from .lan_discovery import LanDiscovery
-from .network_settings import NetworkSettings
-from .password_policy import PasswordPolicy
-from .remote_access import RemoteAccess
-from .server_role import ServerRole
-from .system_settings import SystemSettings
-
 __all__ = [
     "__version__",
     "DomainAudit",
@@ -26,3 +16,30 @@ __all__ = [
     "ServerRole",
     "SystemSettings",
 ]
+
+_MODULES = {
+    "DomainAudit": ".domain_settings",
+    "SecurityAudit": ".endpoint_security",
+    "InstalledApps": ".installed_apps",
+    "LanDiscovery": ".lan_discovery",
+    "NetworkSettings": ".network_settings",
+    "PasswordPolicy": ".password_policy",
+    "RemoteAccess": ".remote_access",
+    "ServerRole": ".server_role",
+    "SystemSettings": ".system_settings",
+}
+
+
+def __getattr__(name: str):
+    """Load audit classes on demand."""
+    if name not in _MODULES:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+
+    from importlib import import_module
+
+    module = import_module(_MODULES[name], __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
