@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform server-role and service discovery."""
 
@@ -11,9 +10,7 @@ import shutil
 import subprocess
 from typing import Any
 
-
-__all__ = ["ServerRoleAudit"]
-
+__all__ = ["ServerRole"]
 
 # Windows service names and their user-facing role names.
 WINDOWS_SERVICES = {

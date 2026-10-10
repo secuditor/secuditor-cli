@@ -1,5 +1,4 @@
-
-# MIT License – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform domain affiliation and identity configuration discovery."""
 
@@ -10,9 +9,7 @@ import pwd
 import shutil
 import subprocess
 
-
-__all__ = ["DomainSettingsAudit"]
-
+__all__ = ["DomainAudit"]
 
 class DomainSettingsAudit:
     """Discover domain affiliation, local users, and related settings."""

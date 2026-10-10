@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform LAN discovery and TCP port auditing."""
 
@@ -15,9 +14,7 @@ from typing import Iterable
 
 import psutil
 
-
 __all__ = ["LanDiscovery"]
-
 
 COMMON_PORTS_TCP = [
     20, 21, 22, 23, 53, 79, 80, 443, 445, 389, 636,

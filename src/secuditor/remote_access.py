@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform remote-access service and exposure diagnostics."""
 
@@ -11,9 +10,7 @@ import socket
 import subprocess
 from typing import Any
 
-
-__all__ = ["RemoteAccessAudit"]
-
+__all__ = ["RemoteAccess"]
 
 class RemoteAccessAudit:
     """Inspect common remote-access services and local TCP listeners.

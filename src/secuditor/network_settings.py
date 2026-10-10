@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform network adapter and configuration discovery."""
 
@@ -14,9 +13,7 @@ import subprocess
 
 import psutil
 
-
-__all__ = ["NetworkSettingsAudit"]
-
+__all__ = ["NetworkSettings"]
 
 class NetworkSettingsAudit:
     """Collect local network configuration on Windows, Linux, and macOS."""

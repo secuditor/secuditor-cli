@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform system settings and hardware inventory."""
 
@@ -14,9 +13,7 @@ import socket
 
 import psutil
 
-
-__all__ = ["SystemSettingsAudit"]
-
+__all__ = ["SystemSettings"]
 
 class SystemSettingsAudit:
     """Collect system inventory and discover hardware where supported."""

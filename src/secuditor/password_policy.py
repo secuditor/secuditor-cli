@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform local password policy discovery."""
 
@@ -9,9 +8,7 @@ import re
 import shutil
 import subprocess
 
-
-__all__ = ["PasswordPolicyAudit"]
-
+__all__ = ["PasswordPolicy"]
 
 class PasswordPolicyAudit:
     """Read available password policy settings without modifying the system."""

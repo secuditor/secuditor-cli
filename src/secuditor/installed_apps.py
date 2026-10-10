@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform installed application discovery."""
 
@@ -8,9 +7,7 @@ import platform
 import plistlib
 import subprocess
 
-
-__all__ = ["InstalledAppsAudit"]
-
+__all__ = ["InstalledApps"]
 
 class InstalledAppsAudit:
     """Discover installed applications on Windows, Linux, and macOS."""

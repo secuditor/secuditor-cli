@@ -1,5 +1,4 @@
-
-# Secuditor – Copyright (c) 2026 Menahem Levinski
+# Secuditor CLI – Copyright (c) 2026 Menahem Levinski
 
 """Cross-platform endpoint security settings audit."""
 
@@ -8,9 +7,7 @@ import platform
 import subprocess
 import json
 
-
-__all__ = ["SecuritySettingsAudit"]
-
+__all__ = ["SecurityAudit"]
 
 class SecuritySettingsAudit:
     """Collect endpoint security configuration and status."""
