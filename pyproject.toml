@@ -3,8 +3,8 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "secuditor-cli"
-version = "0.1.0"
+name = "secuditor"
+version = "0.2.0"
 description = "Cross-platform security diagnostics and auditing toolkit."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,21 +43,21 @@ dependencies = [
 ]
 
 [project.scripts]
-secuditor = "secuditor_cli.cli:main"
+secuditor = "secuditor.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/secuditor/secuditor-cli"
 Repository = "https://github.com/secuditor/secuditor-cli"
 Issues = "https://github.com/secuditor/secuditor-cli/issues"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["secuditor_cli*"]
-
 [project.optional-dependencies]
 test = [
     "pytest>=8.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["secuditor*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
