@@ -53,3 +53,11 @@ Issues = "https://github.com/secuditor/secuditor-cli/issues"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["secuditor_cli*"]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
