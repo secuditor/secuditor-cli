@@ -6,9 +6,10 @@ import os
 import platform
 import re
 import shutil
-import subprocess
 
-__all__ = ["PasswordPolicy"]
+from ._utils import run_command
+
+__all__ = ["PasswordPolicy", "PasswordPolicyAudit"]
 
 class PasswordPolicyAudit:
     """Read available password policy settings without modifying the system."""
@@ -18,26 +19,13 @@ class PasswordPolicyAudit:
         self.system = platform.system()
 
     def _run(self, args):
-        try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return None
+        return run_command(args, timeout=self.timeout)
 
     @staticmethod
     def _setting(value=None, status="unknown", source=None):
         return {
             "value": value,
             "status": status,
-            "source": source,
         }
 
     def _base_report(self):
@@ -76,25 +64,25 @@ class PasswordPolicyAudit:
         else:
             patterns = {
                 "minimum_length": (
-                    r"Minimum password length\s+(\d+)"
+                    r"Minimum password length:?\s+(\d+)"
                 ),
                 "maximum_age_days": (
-                    r"Maximum password age\s+(\d+|Unlimited|Never)"
+                    r"Maximum password age(?:\s+\(days\))?:?\s+(\d+|Unlimited|Never)"
                 ),
                 "minimum_age_days": (
-                    r"Minimum password age\s+(\d+)"
+                    r"Minimum password age(?:\s+\(days\))?:?\s+(\d+)"
                 ),
                 "password_history": (
-                    r"Length of password history maintained\s+(\d+)"
+                    r"Length of password history maintained:?\s+(\d+|None)"
                 ),
                 "lockout_threshold": (
-                    r"Lockout threshold\s+(\d+|Never)"
+                    r"Lockout threshold:?\s+(\d+|Never)"
                 ),
                 "lockout_duration_minutes": (
-                    r"Lockout duration \(minutes\)\s+(\d+|Never)"
+                    r"Lockout duration \(minutes\):?\s+(\d+|Never)"
                 ),
                 "lockout_reset_minutes": (
-                    r"Lockout observation window \(minutes\)\s+(\d+|Never)"
+                    r"Lockout observation window \(minutes\):?\s+(\d+|Never)"
                 ),
             }
 
@@ -108,7 +96,7 @@ class PasswordPolicyAudit:
                 raw = match.group(1).strip()
                 if raw.isdigit():
                     value = int(raw)
-                elif raw.lower() in ("never", "unlimited"):
+                elif raw.lower() in ("never", "unlimited", "none"):
                     value = raw.lower()
                 else:
                     continue
@@ -279,6 +267,28 @@ class PasswordPolicyAudit:
                 "PAM configuration",
             )
 
+        # Read /etc/security/pwquality.conf for minlen if present.
+        try:
+            with open(
+                "/etc/security/pwquality.conf",
+                encoding="utf-8",
+                errors="replace",
+            ) as file:
+                for line in file:
+                    line = line.split("#", 1)[0].strip()
+                    if "=" not in line:
+                        continue
+                    key, val = [part.strip() for part in line.split("=", 1)]
+                    if key == "minlen" and val.isdigit():
+                        report["settings"]["minimum_length"] = self._setting(
+                            int(val),
+                            "detected",
+                            "/etc/security/pwquality.conf",
+                        )
+                        break
+        except OSError:
+            pass
+
         # `chage -l` provides aging data for the current account.
         chage = shutil.which("chage")
         if chage:
@@ -289,7 +299,6 @@ class PasswordPolicyAudit:
                 report["current_user"] = {
                     "username": getpass.getuser(),
                     "password_aging": output,
-                    "source": "chage",
                 }
             else:
                 report["limitations"].append(
@@ -310,7 +319,6 @@ class PasswordPolicyAudit:
             report["global_policy"] = {
                 "value": output,
                 "status": "detected",
-                "source": "pwpolicy",
             }
 
             patterns = {
@@ -367,6 +375,8 @@ class PasswordPolicyAudit:
 
         return report
 
+
+PasswordPolicy = PasswordPolicyAudit
 
 if __name__ == "__main__":
     import json

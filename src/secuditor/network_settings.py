@@ -4,16 +4,15 @@
 
 import ipaddress
 import json
-import os
 import platform
 import re
-import shutil
 import socket
-import subprocess
 
 import psutil
 
-__all__ = ["NetworkSettings"]
+from ._utils import run_command, run_powershell
+
+__all__ = ["NetworkSettings", "NetworkSettingsAudit"]
 
 class NetworkSettingsAudit:
     """Collect local network configuration on Windows, Linux, and macOS."""
@@ -24,19 +23,7 @@ class NetworkSettingsAudit:
 
     def _run(self, args):
         """Run a command safely without a shell."""
-        try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-            if result.returncode == 0:
-                return result.stdout
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return None
+        return run_command(args, timeout=self.timeout, strip=False)
 
     @staticmethod
     def _prefix_from_mask(mask):
@@ -86,7 +73,7 @@ class NetworkSettingsAudit:
                     ip = address.address.split("%", 1)[0]
                     if ip:
                         try:
-                            ip_obj = ipaddress.ip_address(ip)
+                            ipaddress.ip_address(ip)
                         except ValueError:
                             continue
 
@@ -202,6 +189,19 @@ class NetworkSettingsAudit:
 
         return gateways
 
+    _EXCLUDED_DNS_NETWORK = ipaddress.ip_network("fec0:0:0::/48")
+
+    @classmethod
+    def _is_valid_dns_server(cls, value):
+        cleaned = str(value).strip().lower()
+        if cleaned.startswith("fec0:0:0:"):
+            return False
+        try:
+            addr = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return addr not in cls._EXCLUDED_DNS_NETWORK
+
     def _dns_servers(self):
         servers = []
 
@@ -217,11 +217,8 @@ class NetworkSettingsAudit:
             if output:
                 for line in output.splitlines():
                     value = line.strip()
-                    try:
-                        ipaddress.ip_address(value)
+                    if self._is_valid_dns_server(value):
                         servers.append(value)
-                    except ValueError:
-                        continue
 
         elif self.system == "Linux":
             # systemd-resolved provides per-link DNS where available.
@@ -229,14 +226,14 @@ class NetworkSettingsAudit:
             if output:
                 for line in output.splitlines():
                     for value in line.split(":", 1)[-1].split():
-                        try:
-                            ipaddress.ip_address(value)
+                        if self._is_valid_dns_server(value):
                             servers.append(value)
-                        except ValueError:
-                            continue
 
             if not output:
-                servers.extend(self._parse_resolv_conf())
+                servers.extend(
+                    s for s in self._parse_resolv_conf()
+                    if self._is_valid_dns_server(s)
+                )
 
         elif self.system == "Darwin":
             output = self._run(["scutil", "--dns"])
@@ -247,13 +244,89 @@ class NetworkSettingsAudit:
                     )
                     if match:
                         value = match.group(1)
-                        try:
-                            ipaddress.ip_address(value)
+                        if self._is_valid_dns_server(value):
                             servers.append(value)
-                        except ValueError:
-                            continue
 
         return list(dict.fromkeys(servers))
+
+    def _dns_servers_by_adapter(self):
+        if self.system != "Windows":
+            return None
+
+        data = run_powershell(
+            "Get-DnsClientServerAddress "
+            "| Select-Object InterfaceAlias,ServerAddresses "
+            "| ConvertTo-Json -Compress",
+            timeout=self.timeout,
+            parse_json=True,
+        )
+        if data is None:
+            return None
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return None
+
+        by_adapter = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            alias = item.get("InterfaceAlias")
+            addrs = item.get("ServerAddresses") or []
+            if isinstance(addrs, str):
+                addrs = [addrs]
+            if not alias or not isinstance(addrs, list):
+                continue
+            valid = []
+            for addr in addrs:
+                if not isinstance(addr, str):
+                    continue
+                cleaned = addr.strip()
+                if self._is_valid_dns_server(cleaned):
+                    valid.append(cleaned)
+            if valid:
+                existing = by_adapter.setdefault(alias, [])
+                for ip in valid:
+                    if ip not in existing:
+                        existing.append(ip)
+        return by_adapter
+
+    def _dhcp_servers_by_adapter(self):
+        if self.system != "Windows":
+            return None
+
+        data = run_powershell(
+            "$adapters = @{}; "
+            "Get-CimInstance Win32_NetworkAdapter "
+            "| Where-Object { $_.NetConnectionID } "
+            "| ForEach-Object { $adapters[$_.InterfaceIndex] = $_.NetConnectionID }; "
+            "Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' "
+            "| ForEach-Object { "
+            "[PSCustomObject]@{ "
+            "Alias = $adapters[$_.InterfaceIndex]; "
+            "Description = $_.Description; "
+            "DHCPServer = $_.DHCPServer "
+            "} } | ConvertTo-Json -Compress",
+            timeout=self.timeout,
+            parse_json=True,
+        )
+        if data is None:
+            return None
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return None
+
+        by_adapter = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            alias = item.get("Alias")
+            desc = item.get("Description")
+            server = item.get("DHCPServer")
+            if alias and desc and server:
+                by_adapter.setdefault(alias, {})[desc] = [server]
+        return by_adapter
 
     @staticmethod
     def _parse_resolv_conf():
@@ -367,8 +440,14 @@ class NetworkSettingsAudit:
         addresses = self._interface_addresses()
         macs = self._mac_addresses()
         gateways = self._default_gateways()
-        dns_servers = self._dns_servers()
-        dhcp_servers = self._dhcp_servers()
+        dns_by_adapter = self._dns_servers_by_adapter()
+        dns_servers = (
+            [] if dns_by_adapter is not None else self._dns_servers()
+        )
+        dhcp_by_adapter = self._dhcp_servers_by_adapter()
+        dhcp_servers = (
+            {} if dhcp_by_adapter is not None else self._dhcp_servers()
+        )
         wifi = self._wifi_info()
 
         adapters = []
@@ -387,8 +466,16 @@ class NetworkSettingsAudit:
                 "mac_address": macs.get(name),
                 "addresses": entries,
                 "gateways": gateways.get(name, []),
-                "dns_servers": dns_servers,
-                "dhcp_servers": dhcp_servers,
+                "dns_servers": (
+                    dns_by_adapter.get(name, [])
+                    if dns_by_adapter is not None
+                    else dns_servers
+                ),
+                "dhcp_servers": (
+                    dhcp_by_adapter.get(name, {})
+                    if dhcp_by_adapter is not None
+                    else dhcp_servers
+                ),
                 "wifi": next(
                     (item for item in (wifi or [])
                      if item.get("name") == name),
@@ -409,6 +496,8 @@ class NetworkSettingsAudit:
             ],
         }
 
+
+NetworkSettings = NetworkSettingsAudit
 
 if __name__ == "__main__":
     print(json.dumps(

@@ -2,31 +2,34 @@
 
 """Secuditor: Cross-platform security diagnostics and auditing library."""
 
-__version__ = "0.2.0"
+from importlib import import_module
+
+__version__ = "0.4.0"
+__author__ = "Menahem Levinski"
+__license__ = "MIT"
 
 __all__ = [
     "__version__",
+    "__author__",
+    "__license__",
     "DomainAudit",
-    "SecurityAudit",
     "InstalledApps",
-    "LanDiscovery",
     "NetworkSettings",
     "PasswordPolicy",
-    "RemoteAccess",
-    "ServerRole",
     "SystemSettings",
 ]
 
 _MODULES = {
     "DomainAudit": ".domain_settings",
-    "SecurityAudit": ".endpoint_security",
+    "DomainSettingsAudit": ".domain_settings",
     "InstalledApps": ".installed_apps",
-    "LanDiscovery": ".lan_discovery",
+    "InstalledAppsAudit": ".installed_apps",
     "NetworkSettings": ".network_settings",
+    "NetworkSettingsAudit": ".network_settings",
     "PasswordPolicy": ".password_policy",
-    "RemoteAccess": ".remote_access",
-    "ServerRole": ".server_role",
+    "PasswordPolicyAudit": ".password_policy",
     "SystemSettings": ".system_settings",
+    "SystemSettingsAudit": ".system_settings",
 }
 
 
@@ -37,9 +40,12 @@ def __getattr__(name: str):
             f"module {__name__!r} has no attribute {name!r}"
         )
 
-    from importlib import import_module
-
     module = import_module(_MODULES[name], __name__)
     value = getattr(module, name)
     globals()[name] = value
     return value
+
+
+def __dir__() -> list[str]:
+    """Return public package attributes."""
+    return sorted(set(__all__))

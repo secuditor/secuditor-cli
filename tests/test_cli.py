@@ -1,32 +1,67 @@
-import pytest
+import contextlib
+import io
+import json
+import unittest
+from unittest.mock import patch
 
-from secuditor_cli.cli import build_parser
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "domain",
-        "endpoint",
-        "apps",
-        "lan",
-        "network",
-        "password",
-        "remote",
-        "server",
-        "system",
-    ],
-)
-def test_cli_accepts_audit_commands(command):
-    args = build_parser().parse_args([command])
-    assert args.command == command
+from secuditor.cli import build_parser, main
 
 
-def test_json_option():
-    args = build_parser().parse_args(["endpoint", "--json"])
-    assert args.json is True
+class TestCLI(unittest.TestCase):
+    def test_cli_accepts_audit_flags(self):
+        cases = [
+            ("-dsa", "dsa"),
+            ("-app", "app"),
+            ("-pas", "pas"),
+            ("-sys", "sys"),
+            ("-net", "net"),
+            ("--domain", "dsa"),
+            ("--apps", "app"),
+            ("--password", "pas"),
+            ("--system", "sys"),
+            ("--network", "net"),
+        ]
+        parser = build_parser()
+        for flag, expected in cases:
+            with self.subTest(flag=flag):
+                args = parser.parse_args([flag])
+                self.assertEqual(args.audit, expected)
+                self.assertFalse(args.json)
+
+    def test_json_option(self):
+        args = build_parser().parse_args(["-net", "--json"])
+        self.assertEqual(args.audit, "net")
+        self.assertTrue(args.json)
+
+    def test_requires_exactly_one_audit_flag(self):
+        parser = build_parser()
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args([])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["-dsa", "-net"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["-end"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["-d"])
+
+    def test_main_invokes_audit_and_prints_json(self):
+        class FakeAudit:
+            def audit(self):
+                return {"platform": "TestOS", "ok": True}
+
+        stdout = io.StringIO()
+        with patch("secuditor.cli.import_module") as mock_import:
+            mock_import.return_value.DomainAudit = FakeAudit
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(["-dsa", "--json"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"platform": "TestOS", "ok": True},
+        )
 
 
-def test_json_defaults_to_false():
-    args = build_parser().parse_args(["domain"])
-    assert args.json is False
+if __name__ == "__main__":
+    unittest.main()

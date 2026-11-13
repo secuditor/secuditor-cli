@@ -1,32 +1,38 @@
-from secuditor_cli import (
-    __version__,
+import unittest
+
+import secuditor
+from secuditor import (
     DomainAudit,
-    SecurityAudit,
     InstalledApps,
-    LanDiscovery,
     NetworkSettings,
     PasswordPolicy,
-    RemoteAccess,
-    ServerRole,
     SystemSettings,
+    __version__,
 )
 
 
-def test_package_version():
-    assert __version__ == "0.1.0"
+class TestPackageImports(unittest.TestCase):
+    def test_package_version(self):
+        self.assertEqual(__version__, "0.4.0")
+
+    def test_public_classes_are_importable(self):
+        classes = [
+            DomainAudit,
+            InstalledApps,
+            NetworkSettings,
+            PasswordPolicy,
+            SystemSettings,
+        ]
+        self.assertTrue(all(isinstance(cls, type) for cls in classes))
+        for cls in classes:
+            self.assertTrue(callable(getattr(cls, "audit", None)))
+
+    def test_removed_attributes_raise(self):
+        for name in ("SecurityAudit", "LanDiscovery", "RemoteAccess", "ServerRole"):
+            with self.subTest(name=name):
+                with self.assertRaises(AttributeError):
+                    getattr(secuditor, name)
 
 
-def test_public_classes_are_importable():
-    classes = [
-        DomainAudit,
-        SecurityAudit,
-        InstalledApps,
-        LanDiscovery,
-        NetworkSettings,
-        PasswordPolicy,
-        RemoteAccess,
-        ServerRole,
-        SystemSettings,
-    ]
-
-    assert all(isinstance(cls, type) for cls in classes)
+if __name__ == "__main__":
+    unittest.main()

@@ -5,9 +5,10 @@
 import os
 import platform
 import plistlib
-import subprocess
 
-__all__ = ["InstalledApps"]
+from ._utils import run_command
+
+__all__ = ["InstalledApps", "InstalledAppsAudit"]
 
 class InstalledAppsAudit:
     """Discover installed applications on Windows, Linux, and macOS."""
@@ -17,19 +18,7 @@ class InstalledAppsAudit:
         self.system = platform.system()
 
     def _run(self, args):
-        try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-            if result.returncode == 0:
-                return result.stdout
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return None
+        return run_command(args, timeout=self.timeout, strip=False)
 
     def _windows_apps(self):
         import winreg
@@ -85,13 +74,15 @@ class InstalledAppsAudit:
 
                                     item = {
                                         "name": name.strip(),
-                                        "version": version,
-                                        "publisher": publisher,
-                                        "source": "windows_registry",
-                                        "scope": (
-                                            "system"
-                                            if root_name == "HKLM"
-                                            else "user"
+                                        "version": (
+                                            version.strip()
+                                            if isinstance(version, str)
+                                            else version
+                                        ),
+                                        "publisher": (
+                                            publisher.strip()
+                                            if isinstance(publisher, str)
+                                            else publisher
                                         ),
                                     }
 
@@ -113,14 +104,27 @@ class InstalledAppsAudit:
         return list(apps.values())
 
     def _linux_apps(self):
-        # Debian / Ubuntu and derivatives.
-        if self._run(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\n"]) is not None:
-            output = self._run([
-                "dpkg-query", "-W", "-f=${binary:Package}\t${Version}\n"
-            ])
-            apps = []
+        apps = []
 
-            if output:
+        # Debian / Ubuntu and derivatives.
+        output = self._run([
+            "dpkg-query", "-W", "-f=${binary:Package}\t${Version}\n"
+        ])
+        if output is not None:
+            for line in output.splitlines():
+                parts = line.split("\t", 1)
+                if parts and parts[0].strip():
+                    apps.append({
+                        "name": parts[0].strip(),
+                        "version": parts[1].strip() if len(parts) > 1 else None,
+                        "publisher": None,
+                    })
+        else:
+            # Fedora / RHEL / openSUSE and other RPM-based distributions.
+            output = self._run([
+                "rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"
+            ])
+            if output is not None:
                 for line in output.splitlines():
                     parts = line.split("\t", 1)
                     if parts and parts[0].strip():
@@ -128,38 +132,13 @@ class InstalledAppsAudit:
                             "name": parts[0].strip(),
                             "version": parts[1].strip() if len(parts) > 1 else None,
                             "publisher": None,
-                            "source": "dpkg",
-                            "scope": "system",
                         })
 
-            return apps
-
-        # Fedora / RHEL / openSUSE and other RPM-based distributions.
-        output = self._run([
-            "rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"
-        ])
-
-        if output is not None:
-            apps = []
-            for line in output.splitlines():
-                parts = line.split("\t", 1)
-                if parts and parts[0].strip():
-                    apps.append({
-                        "name": parts[0].strip(),
-                        "version": parts[1].strip() if len(parts) > 1 else None,
-                        "publisher": None,
-                        "source": "rpm",
-                        "scope": "system",
-                    })
-            return apps
-
-        # Flatpak applications, if installed.
+        # Flatpak applications, if installed (may coexist with dpkg/rpm).
         output = self._run([
             "flatpak", "list", "--app", "--columns=application,version"
         ])
-
         if output is not None:
-            apps = []
             for line in output.splitlines():
                 parts = line.split("\t", 1)
                 if parts and parts[0].strip():
@@ -167,12 +146,9 @@ class InstalledAppsAudit:
                         "name": parts[0].strip(),
                         "version": parts[1].strip() if len(parts) > 1 else None,
                         "publisher": None,
-                        "source": "flatpak",
-                        "scope": "unknown",
                     })
-            return apps
 
-        return []
+        return apps
 
     def _macos_apps(self):
         apps = []
@@ -180,7 +156,9 @@ class InstalledAppsAudit:
 
         roots = [
             "/Applications",
+            "/Applications/Utilities",
             "/System/Applications",
+            "/System/Applications/Utilities",
             os.path.expanduser("~/Applications"),
         ]
 
@@ -236,14 +214,6 @@ class InstalledAppsAudit:
                         "name": str(name).strip(),
                         "version": version,
                         "publisher": publisher,
-                        "source": "application_bundle",
-                        "scope": (
-                            "user"
-                            if os.path.abspath(root).startswith(
-                                os.path.expanduser("~") + os.sep
-                            )
-                            else "system"
-                        ),
                         "path": bundle_path,
                     })
 
@@ -273,6 +243,8 @@ class InstalledAppsAudit:
             ],
         }
 
+
+InstalledApps = InstalledAppsAudit
 
 if __name__ == "__main__":
     import json

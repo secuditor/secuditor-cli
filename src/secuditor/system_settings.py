@@ -3,27 +3,18 @@
 """Cross-platform system settings and hardware inventory."""
 
 import json
-import os
 import platform
-import plistlib
 import shutil
-import subprocess
-import sys
 import socket
 
 import psutil
 
-__all__ = ["SystemSettings"]
+from ._utils import find_powershell, run_command, run_powershell
+
+__all__ = ["SystemSettings", "SystemSettingsAudit"]
 
 class SystemSettingsAudit:
     """Collect system inventory and discover hardware where supported."""
-
-    PNP_CLASSES = {
-        "Printers": "Printer",
-        "Cameras": "Camera",
-        "Bluetooth Devices": "Bluetooth",
-        "Biometric Devices": "Biometric",
-    }
 
     def __init__(self, timeout=8):
         self.timeout = timeout
@@ -31,19 +22,7 @@ class SystemSettingsAudit:
 
     def _run(self, args):
         """Run a command without a shell; return stdout or None."""
-        try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return None
+        return run_command(args, timeout=self.timeout)
 
     def get_system_settings(self):
         memory = psutil.virtual_memory()
@@ -97,17 +76,13 @@ class SystemSettingsAudit:
                 if entry.family == getattr(psutil, "AF_LINK", object()):
                     if entry.address:
                         mac = entry.address
-                elif entry.family == getattr(
-                    __import__("socket"), "AF_INET"
-                ):
+                elif entry.family == socket.AF_INET:
                     ips.append({
                         "address": entry.address,
                         "family": "IPv4",
                         "netmask": entry.netmask,
                     })
-                elif entry.family == getattr(
-                    __import__("socket"), "AF_INET6"
-                ):
+                elif entry.family == socket.AF_INET6:
                     ips.append({
                         "address": entry.address.split("%", 1)[0],
                         "family": "IPv6",
@@ -130,61 +105,64 @@ class SystemSettingsAudit:
         return adapters
 
     def _windows_hardware(self):
-        """Discover present hardware using PowerShell on Windows."""
-        powershell = shutil.which("powershell") or shutil.which("pwsh")
-        if not powershell:
+        """Discover present hardware using a single PowerShell query on Windows."""
+        if not find_powershell():
             return None
 
+        script = (
+            "$present = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue; "
+            "$result = [ordered]@{ "
+            "'Printers' = @($present | Where-Object { $_.Class -eq 'Printer' } "
+            "| Select-Object -ExpandProperty FriendlyName); "
+            "'Cameras' = @($present | Where-Object { $_.Class -in @('Camera','Image') } "
+            "| Select-Object -ExpandProperty FriendlyName); "
+            "'Bluetooth Devices' = @($present | Where-Object { $_.Class -eq 'Bluetooth' } "
+            "| Select-Object -ExpandProperty FriendlyName); "
+            "'USB Devices' = @($present | Where-Object { $_.InstanceId -like 'USB*' } "
+            "| Select-Object -ExpandProperty FriendlyName); "
+            "'Biometric Devices' = @($present | Where-Object { $_.Class -eq 'Biometric' } "
+            "| Select-Object -ExpandProperty FriendlyName) "
+            "}; "
+            "$result | ConvertTo-Json -Compress"
+        )
+
+        data = run_powershell(script, timeout=self.timeout, parse_json=True)
+        category_names = (
+            "Printers",
+            "Cameras",
+            "Bluetooth Devices",
+            "USB Devices",
+            "Biometric Devices",
+        )
         categories = {}
 
-        commands = {
-            "Printers": (
-                "Get-PnpDevice -PresentOnly -Class Printer "
-                "| Select-Object -ExpandProperty FriendlyName"
-            ),
-            "Cameras": (
-                "Get-PnpDevice -PresentOnly "
-                "| Where-Object { $_.Class -in @('Camera','Image') } "
-                "| Select-Object -ExpandProperty FriendlyName"
-            ),
-            "Bluetooth Devices": (
-                "Get-PnpDevice -PresentOnly -Class Bluetooth "
-                "| Select-Object -ExpandProperty FriendlyName"
-            ),
-            "USB Devices": (
-                "Get-PnpDevice -PresentOnly "
-                "| Where-Object { $_.InstanceId -like 'USB*' } "
-                "| Select-Object -ExpandProperty FriendlyName"
-            ),
-            "Biometric Devices": (
-                "Get-PnpDevice -PresentOnly -Class Biometric "
-                "| Select-Object -ExpandProperty FriendlyName"
-            ),
-        }
-
-        for category, command in commands.items():
-            output = self._run([
-                powershell,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                command,
-            ])
-
-            if output is None:
+        if not isinstance(data, dict):
+            for category in category_names:
                 categories[category] = {
                     "status": "unavailable",
                     "devices": [],
                 }
+            return categories
+
+        for category in category_names:
+            raw = data.get(category)
+            if raw is None:
+                devices = []
+            elif isinstance(raw, str):
+                devices = [raw.strip()] if raw.strip() else []
+            elif isinstance(raw, list):
+                devices = [
+                    str(item).strip()
+                    for item in raw
+                    if item is not None and str(item).strip()
+                ]
             else:
-                categories[category] = {
-                    "status": "available",
-                    "devices": [
-                        line.strip()
-                        for line in output.splitlines()
-                        if line.strip()
-                    ],
-                }
+                devices = []
+
+            categories[category] = {
+                "status": "available",
+                "devices": devices,
+            }
 
         return categories
 
@@ -291,10 +269,6 @@ class SystemSettingsAudit:
             hardware = None
 
         return {
-            "Network Adapters": {
-                "status": "available",
-                "devices": self.scan_network_adapters(),
-            },
             "Hardware": hardware or {
                 "status": "unsupported",
                 "devices": [],
@@ -307,6 +281,8 @@ class SystemSettingsAudit:
             "hardware": self.get_hardware_report(),
         }
 
+
+SystemSettings = SystemSettingsAudit
 
 if __name__ == "__main__":
     print(json.dumps(

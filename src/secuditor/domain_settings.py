@@ -3,13 +3,12 @@
 """Cross-platform domain affiliation and identity configuration discovery."""
 
 import json
-import os
 import platform
-import pwd
 import shutil
-import subprocess
 
-__all__ = ["DomainAudit"]
+from ._utils import read_registry_value, run_command, run_powershell
+
+__all__ = ["DomainAudit", "DomainSettingsAudit"]
 
 class DomainSettingsAudit:
     """Discover domain affiliation, local users, and related settings."""
@@ -28,43 +27,10 @@ class DomainSettingsAudit:
         self.system = platform.system()
 
     def _run(self, args):
-        try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return None
+        return run_command(args, timeout=self.timeout)
 
     def _powershell(self, command):
-        executable = (
-            shutil.which("powershell")
-            or shutil.which("pwsh")
-        )
-        if not executable:
-            return None
-
-        output = self._run([
-            executable,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            command,
-        ])
-
-        if not output:
-            return None
-
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError:
-            return None
+        return run_powershell(command, timeout=self.timeout, parse_json=True)
 
     @staticmethod
     def _unknown():
@@ -93,18 +59,7 @@ class DomainSettingsAudit:
         }
 
     def _windows_registry_value(self, path, name):
-        try:
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                path,
-                0,
-                winreg.KEY_READ,
-            ) as key:
-                return winreg.QueryValueEx(key, name)[0]
-        except (OSError, ImportError):
-            return None
+        return read_registry_value("HKLM", path, name)
 
     def _windows_affiliation(self, report):
         # CIM is used to retrieve computer domain membership and role.
@@ -113,6 +68,7 @@ class DomainSettingsAudit:
             "Select-Object Name,Domain,PartOfDomain,DomainRole | "
             "ConvertTo-Json -Compress"
         )
+        domain = None
 
         if isinstance(computer, dict):
             joined = computer.get("PartOfDomain")
@@ -155,10 +111,10 @@ class DomainSettingsAudit:
                 if ":" not in line:
                     continue
                 key, value = line.split(":", 1)
-                flags[key.strip()] = value.strip().upper()
+                flags[key.strip()] = value.strip()
 
-            entra_joined = flags.get("AzureAdJoined") == "YES"
-            domain_joined = flags.get("DomainJoined") == "YES"
+            entra_joined = flags.get("AzureAdJoined", "").upper() == "YES"
+            domain_joined = flags.get("DomainJoined", "").upper() == "YES"
 
             if entra_joined or domain_joined:
                 if entra_joined and domain_joined:
@@ -173,9 +129,9 @@ class DomainSettingsAudit:
                     "value": {
                         "type": join_type,
                         "name": (
-                            flags.get("DomainName")
+                            (flags.get("DomainName") or domain)
                             if domain_joined else
-                            flags.get("TenantName")
+                            (flags.get("TenantName") or domain)
                         ),
                         "entra_joined": entra_joined,
                         "domain_joined": domain_joined,
@@ -188,17 +144,28 @@ class DomainSettingsAudit:
         self._windows_ntlm(report)
         self._windows_ntp(report)
 
+    @staticmethod
+    def _extract_sid(sid):
+        if isinstance(sid, dict):
+            value = sid.get("Value")
+            return str(value) if value is not None else None
+        if sid is None:
+            return None
+        return str(sid)
+
     def _windows_users(self, report):
         # Get-LocalUser and Get-LocalGroupMember may be unavailable
         # on some Windows editions or in constrained environments.
         users = self._powershell(
-            "Get-LocalUser | Select-Object Name,Enabled,SID "
+            "Get-LocalUser | Select-Object Name,Enabled,"
+            "@{Name='SID';Expression={$_.SID.Value}} "
             "| ConvertTo-Json -Compress"
         )
 
         admins = self._powershell(
             "Get-LocalGroupMember -Group 'Administrators' "
-            "| Select-Object Name,SID,PrincipalSource "
+            "| Select-Object Name,"
+            "@{Name='SID';Expression={$_.SID.Value}},PrincipalSource "
             "| ConvertTo-Json -Compress"
         )
 
@@ -218,22 +185,25 @@ class DomainSettingsAudit:
         if not isinstance(admins, list):
             admins = []
 
-        admin_sids = {
-            item.get("SID")
-            for item in admins
-            if isinstance(item, dict) and item.get("SID")
-        }
+        admin_sids = set()
+        for item in admins:
+            if not isinstance(item, dict):
+                continue
+            sid = self._extract_sid(item.get("SID"))
+            if sid:
+                admin_sids.add(sid)
 
         for user in users:
             if not isinstance(user, dict):
                 continue
 
+            sid = self._extract_sid(user.get("SID"))
             item = {
                 "name": user.get("Name"),
                 "enabled": user.get("Enabled"),
-                "sid": user.get("SID"),
+                "sid": sid,
                 "administrator_member": (
-                    user.get("SID") in admin_sids
+                    sid is not None and sid in admin_sids
                 ),
             }
 
@@ -393,31 +363,55 @@ class DomainSettingsAudit:
 
     def _linux_users(self, report):
         try:
+            import pwd
+
             users = []
+            excluded_names = {"nobody", "nfsnobody"}
 
             for entry in pwd.getpwall():
-                if entry.pw_uid >= 1000 or entry.pw_uid == 0:
+                if (
+                    entry.pw_uid == 0
+                    or (
+                        entry.pw_uid >= 1000
+                        and entry.pw_uid != 65534
+                        and entry.pw_name not in excluded_names
+                    )
+                ):
                     users.append({
                         "name": entry.pw_name,
                         "uid": entry.pw_uid,
+                        "gid": entry.pw_gid,
                         "home": entry.pw_dir,
                         "shell": entry.pw_shell,
                     })
 
             privileged_names = {"root"}
+            privileged_gids = set()
             for group_name in ("sudo", "wheel"):
                 try:
                     import grp
                     group = grp.getgrnam(group_name)
                     privileged_names.update(group.gr_mem)
-                except KeyError:
+                    privileged_gids.add(group.gr_gid)
+                except (KeyError, ImportError):
                     continue
 
             for user in users:
-                if user["name"] in privileged_names or user["uid"] == 0:
-                    report["users"]["privileged"].append(user)
+                is_privileged = (
+                    user["name"] in privileged_names
+                    or user["uid"] == 0
+                    or user["gid"] in privileged_gids
+                )
+                user_record = {
+                    "name": user["name"],
+                    "uid": user["uid"],
+                    "home": user["home"],
+                    "shell": user["shell"],
+                }
+                if is_privileged:
+                    report["users"]["privileged"].append(user_record)
                 else:
-                    report["users"]["regular"].append(user)
+                    report["users"]["regular"].append(user_record)
 
             report["users"]["status"] = "detected"
             report["limitations"].append(
@@ -492,11 +486,16 @@ class DomainSettingsAudit:
             "source": None,
         }
 
-        output = self._run(["sntp", "-d", "time.apple.com"])
+        # Inspect local macOS NTP configuration without making outbound queries.
+        ntp_server = self._run(["systemsetup", "-getnetworktimeserver"])
+        ntp_enabled = self._run(["systemsetup", "-getusingnetworktime"])
+        ntp_details = "\n".join(
+            part for part in (ntp_enabled, ntp_server) if part
+        )
         report["ntp"] = {
-            "status": "detected" if output else "unknown",
-            "value": output,
-            "source": "sntp" if output else None,
+            "status": "detected" if ntp_details else "unknown",
+            "value": ntp_details or None,
+            "source": "systemsetup" if ntp_details else None,
         }
 
     def _macos_users(self, report):
@@ -563,6 +562,8 @@ class DomainSettingsAudit:
 
         return report
 
+
+DomainAudit = DomainSettingsAudit
 
 if __name__ == "__main__":
     print(json.dumps(
