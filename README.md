@@ -14,8 +14,10 @@ Run a specific audit module using its flag (add `--json` for JSON output):
 
 ```bash
 secuditor -dsa          # Domain affiliation, users, LAPS, NTLM, and NTP
+secuditor -end          # Endpoint security settings (Defender, firewall, BitLocker, UAC, MAC, etc.)
 secuditor -app          # Installed applications inventory
 secuditor -pwd          # Local password policy settings
+secuditor -ssl          # SSL/TLS interception and certificate trust inspection
 secuditor -sys          # System specifications and connected hardware
 secuditor -net          # Network adapters, IPs, gateways, DNS, DHCP, and Wi-Fi
 ```
@@ -27,7 +29,7 @@ secuditor -net --json
 secuditor --version
 ```
 
-Long flag aliases (`--domain`, `--apps`, `--password`, `--system`, `--network`) are also supported.
+Long flag aliases (`--domain`, `--endpoint`, `--apps`, `--password`, `--ssl`, `--system`, `--network`) are also supported.
 
 ## Python Library Usage
 
@@ -36,9 +38,11 @@ Audit classes are lazily loaded from `secuditor` and expose an `.audit()` method
 ```python
 from secuditor import (
     DomainAudit,
+    SecurityAudit,
     InstalledApps,
     NetworkSettings,
     PasswordPolicy,
+    SSLInterception,
     SystemSettings,
 )
 

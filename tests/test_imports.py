@@ -6,6 +6,8 @@ from secuditor import (
     InstalledApps,
     NetworkSettings,
     PasswordPolicy,
+    SSLInterception,
+    SecurityAudit,
     SystemSettings,
     __version__,
 )
@@ -18,9 +20,11 @@ class TestPackageImports(unittest.TestCase):
     def test_public_classes_are_importable(self):
         classes = [
             DomainAudit,
+            SecurityAudit,
             InstalledApps,
             NetworkSettings,
             PasswordPolicy,
+            SSLInterception,
             SystemSettings,
         ]
         self.assertTrue(all(isinstance(cls, type) for cls in classes))
@@ -28,7 +32,7 @@ class TestPackageImports(unittest.TestCase):
             self.assertTrue(callable(getattr(cls, "audit", None)))
 
     def test_removed_attributes_raise(self):
-        for name in ("SecurityAudit", "LanDiscovery", "RemoteAccess", "ServerRole"):
+        for name in ("LanDiscovery", "RemoteAccess", "ServerRole"):
             with self.subTest(name=name):
                 with self.assertRaises(AttributeError):
                     getattr(secuditor, name)

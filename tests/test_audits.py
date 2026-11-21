@@ -1,16 +1,25 @@
 import builtins
+from datetime import datetime, timedelta, timezone
 import io
 import os
 import socket
+import ssl
 import types
 import unittest
 from unittest.mock import patch
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from secuditor import (
     DomainAudit,
     InstalledApps,
     NetworkSettings,
     PasswordPolicy,
+    SSLInterception,
+    SecurityAudit,
     SystemSettings,
 )
 from secuditor._utils import _sanitize_path_env, _system_exe
@@ -429,6 +438,174 @@ class TestSystemSettingsAudit(unittest.TestCase):
             side_effect=lambda _r, _p, name: reg.get(name),
         ):
             self.assertEqual(audit._windows_os_name(), "Windows 11 Pro (24H2)")
+
+
+class TestSSLInterceptionAudit(unittest.TestCase):
+    @staticmethod
+    def _build_test_der(issuer_org: str, san_dns: str) -> bytes:
+        key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, san_dns),
+        ])
+        issuer = x509.Name([
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, issuer_org),
+            x509.NameAttribute(NameOID.COMMON_NAME, f"{issuer_org} Root CA"),
+        ])
+        now = datetime.now(timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=90))
+            .add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(san_dns)]),
+                critical=False,
+            )
+            .sign(key, hashes.SHA256())
+        )
+        return cert.public_bytes(serialization.Encoding.DER)
+
+    def test_public_trusted_certificate_not_detected(self):
+        der = self._build_test_der("Google Trust Services", "*.google.com")
+        audit = SSLInterception()
+
+        with (
+            patch.object(audit, "_fetch_peer_cert", return_value=(der, "TLSv1.3")),
+            patch.object(audit, "_verify_public_chain", return_value=True),
+        ):
+            result = audit.audit("www.google.com", 443)
+
+        self.assertEqual(result["verdict"], "Not Detected")
+        self.assertFalse(result["ssl_interception_detected"])
+        self.assertEqual(result["key_type"], "ECC")
+        self.assertEqual(result["key_bits"], 256)
+        self.assertEqual(result["tls_version"], "TLSv1.3")
+
+    def test_enterprise_firewall_issuer_classified_as_likely_legitimate(self):
+        der = self._build_test_der("Zscaler", "www.google.com")
+        audit = SSLInterception()
+
+        with (
+            patch.object(audit, "_fetch_peer_cert", return_value=(der, "TLSv1.3")),
+            patch.object(audit, "_verify_public_chain", return_value=False),
+        ):
+            result = audit.audit("www.google.com", 443)
+
+        self.assertEqual(result["verdict"], "Likely Legitimate")
+        self.assertTrue(result["ssl_interception_detected"])
+        self.assertTrue(result["interception_legit"])
+        self.assertIn("Zscaler", result["interception_reason"])
+
+    def test_untrusted_certificate_classified_as_suspicious(self):
+        der = self._build_test_der("Unknown Corp", "www.google.com")
+        audit = SSLInterception()
+
+        def fake_fetch(_host, _port, ctx):
+            if ctx.verify_mode == ssl.CERT_REQUIRED:
+                raise ssl.SSLCertVerificationError("self-signed certificate")
+            return der, "TLSv1.3"
+
+        with patch.object(audit, "_fetch_peer_cert", side_effect=fake_fetch):
+            result = audit.audit("www.google.com", 443)
+
+        self.assertEqual(result["verdict"], "Suspicious")
+        self.assertTrue(result["ssl_interception_detected"])
+        self.assertFalse(result["interception_legit"])
+
+
+class TestEndpointSecurityAudit(unittest.TestCase):
+    def test_windows_audit_decodes_av_bitlocker_shell_and_hvci(self):
+        audit = SecurityAudit()
+        audit.system = "Windows"
+
+        ps_bundle = {
+            "defender": {"AMServiceEnabled": True},
+            "av": [
+                {"displayName": "Windows Defender", "productState": 397568},
+                {"displayName": "CrowdStrike Falcon", "productState": 266240},
+            ],
+            "dep": 3,
+            "dg_running": [1],
+            "exec_policy": "RemoteSigned",
+            "bitlocker": {"source": "shell", "values": [1]},
+            "sb_wmi": True,
+        }
+        reg_map = {
+            ("HKLM", r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity", "Enabled"): 1,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Control\SecureBoot\State", "UEFISecureBootEnabled"): 1,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Services\USBSTOR", "Start"): 4,
+            ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer", "NoDriveTypeAutoRun"): 255,
+        }
+
+        with (
+            patch.object(audit, "_windows_ps_bundle", return_value=ps_bundle),
+            patch.object(audit, "_windows_firewall_managed_by", return_value={"managed": False, "product_name": None}),
+            patch.object(audit, "_windows_firewall_state", return_value="On"),
+            patch.object(audit, "_windows_auto_screen_lock", return_value="Default (Sleep lock enabled)"),
+            patch.object(audit, "_windows_macro_policy", return_value=["Disabled (With notification)"]),
+            patch.object(audit, "_windows_defender_asr", return_value="Not Configured"),
+            patch.object(audit, "_windows_uac", return_value="Prompt for consent (Non-Windows binaries)"),
+            patch.object(audit, "_windows_anonymous_access", return_value="Restricted"),
+            patch.object(audit, "_windows_efs_scan", return_value="No encrypted files"),
+            patch.object(audit, "_windows_system_restore", return_value="Enabled"),
+            patch("secuditor.endpoint_security.read_registry_value", side_effect=lambda r, p, n: reg_map.get((r, p, n))),
+        ):
+            report = audit.audit()
+
+        checks = report["checks"]
+        self.assertEqual(checks["Windows Defender"], ["Windows Defender (Active)"])
+        self.assertEqual(checks["Endpoint Protection"], ["CrowdStrike Falcon (Active)"])
+        self.assertEqual(checks["Host-based Firewall"], "Windows Firewall (On)")
+        self.assertEqual(checks["Core Isolation"], "Disabled (Configured, not running)")
+        self.assertEqual(checks["Data Execution Prevention"], "Enabled (Opt Out)")
+        self.assertEqual(checks["BitLocker Drive Encryption"], "Enabled")
+        self.assertEqual(checks["UEFI Secure Boot"], "Enabled")
+        self.assertEqual(checks["Removable Storage"], "Disabled")
+        self.assertEqual(checks["USB AutoRun"], "Disabled")
+
+    def test_linux_audit_reports_mac_firewall_aslr_and_luks(self):
+        audit = SecurityAudit()
+        audit.system = "Linux"
+
+        fake_files = {
+            "/sys/module/apparmor/parameters/enabled": "Y\n",
+            "/proc/sys/kernel/randomize_va_space": "2\n",
+        }
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            if path in fake_files:
+                return io.StringIO(fake_files[path])
+            return real_open(path, *args, **kwargs)
+
+        def fake_run(cmd):
+            if cmd[0] == "ufw":
+                return "Status: active\n"
+            if cmd[0] == "lsblk":
+                return '{"blockdevices":[{"name":"sda2","type":"crypt","fstype":"crypto_LUKS"}]}'
+            return None
+
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in fake_files),
+            patch("os.path.isdir", return_value=False),
+            patch("builtins.open", side_effect=fake_open),
+            patch("shutil.which", side_effect=lambda c: f"/usr/bin/{c}" if c in ("ufw", "lsblk", "timeshift") else None),
+            patch("psutil.process_iter", return_value=[]),
+            patch("glob.glob", return_value=[]),
+            patch.object(audit, "_run", side_effect=fake_run),
+        ):
+            report = audit.audit()
+
+        checks = report["checks"]
+        self.assertEqual(checks["Mandatory Access Control"], "AppArmor (Enabled)")
+        self.assertEqual(checks["Host-based Firewall"], "UFW (On)")
+        self.assertEqual(checks["Kernel Hardening (ASLR)"], "Enabled (Full ASLR)")
+        self.assertEqual(checks["Disk Encryption"], "Enabled (LUKS/dm-crypt)")
+        self.assertEqual(checks["UEFI Secure Boot"], "Unsupported")
+        self.assertEqual(checks["System Snapshots"], "Available (Timeshift)")
 
 
 if __name__ == "__main__":

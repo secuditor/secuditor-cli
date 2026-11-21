@@ -69,7 +69,7 @@ You can help in many ways:
 To keep the project clean and consistent, please follow these rules:
 
 * Python version: **Python 3.10 or later** (`requires-python = ">=3.10"`)
-* Keep dependencies minimal (`psutil` plus the Python standard library)
+* Keep dependencies minimal (`psutil`, `cryptography`, `certifi`, plus the Python standard library)
 * Keep all audits **strictly read-only** — do not mutate system, registry, or policy configuration
 * Preserve safe subprocess execution (`shell=False`, explicit timeouts, System32 path resolution on Windows via `_utils.py`) and proper Win32 `ctypes` buffer cleanup (`NetApiBufferFree`)
 * Guard platform-specific imports and behavior cleanly (e.g., `winreg`, `pwd`/`grp`, `ctypes.windll`) so imports work on Windows, Linux, and macOS

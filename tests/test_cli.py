@@ -11,13 +11,17 @@ class TestCLI(unittest.TestCase):
     def test_cli_accepts_audit_flags(self):
         cases = [
             ("-dsa", "dsa"),
+            ("-end", "end"),
             ("-app", "app"),
             ("-pwd", "pwd"),
+            ("-ssl", "ssl"),
             ("-sys", "sys"),
             ("-net", "net"),
             ("--domain", "dsa"),
+            ("--endpoint", "end"),
             ("--apps", "app"),
             ("--password", "pwd"),
+            ("--ssl", "ssl"),
             ("--system", "sys"),
             ("--network", "net"),
         ]
@@ -42,8 +46,6 @@ class TestCLI(unittest.TestCase):
                 parser.parse_args(["-dsa", "-net"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["-pas"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["-end"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["-d"])
 

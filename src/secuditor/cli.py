@@ -12,8 +12,10 @@ from . import __version__
 
 _AUDIT_SPECS = {
     "dsa": (".domain_settings", "DomainAudit", "Domain Settings Audit"),
+    "end": (".endpoint_security", "SecurityAudit", "Endpoint Security Audit"),
     "app": (".installed_apps", "InstalledApps", "Installed Applications Audit"),
     "pwd": (".password_policy", "PasswordPolicy", "Password Policy Audit"),
+    "ssl": (".ssl_interception", "SSLInterception", "SSL Interception Audit"),
     "sys": (".system_settings", "SystemSettings", "System Settings Audit"),
     "net": (".network_settings", "NetworkSettings", "Network Settings Audit"),
 }
@@ -49,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit domain settings",
     )
     group.add_argument(
+        "-end",
+        "--endpoint",
+        dest="audit",
+        action="store_const",
+        const="end",
+        help="Audit endpoint security",
+    )
+    group.add_argument(
         "-app",
         "--apps",
         dest="audit",
@@ -63,6 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const="pwd",
         help="Audit password policy",
+    )
+    group.add_argument(
+        "-ssl",
+        "--ssl",
+        dest="audit",
+        action="store_const",
+        const="ssl",
+        help="Audit SSL/TLS interception",
     )
     group.add_argument(
         "-sys",
