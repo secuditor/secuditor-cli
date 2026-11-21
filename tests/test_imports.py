@@ -3,6 +3,7 @@ import unittest
 import secuditor
 from secuditor import (
     DomainAudit,
+    FullAudit,
     InstalledApps,
     NetworkSettings,
     PasswordPolicy,
@@ -15,17 +16,18 @@ from secuditor import (
 
 class TestPackageImports(unittest.TestCase):
     def test_package_version(self):
-        self.assertEqual(__version__, "0.6.0")
+        self.assertEqual(__version__, "0.7.0")
 
     def test_public_classes_are_importable(self):
         classes = [
             DomainAudit,
             SecurityAudit,
-            InstalledApps,
             NetworkSettings,
+            InstalledApps,
             PasswordPolicy,
             SSLInterception,
             SystemSettings,
+            FullAudit,
         ]
         self.assertTrue(all(isinstance(cls, type) for cls in classes))
         for cls in classes:

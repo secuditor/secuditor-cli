@@ -13,23 +13,25 @@ pip install secuditor
 Run a specific audit module using its flag (add `--json` for JSON output):
 
 ```bash
-secuditor -dsa          # Domain affiliation, users, LAPS, NTLM, and NTP
+secuditor -com          # System specifications and connected hardware
 secuditor -end          # Endpoint security settings (Defender, firewall, BitLocker, UAC, MAC, etc.)
+secuditor -net          # Network adapters, IPs, gateways, DNS, DHCP, and Wi-Fi
 secuditor -app          # Installed applications inventory
+secuditor -dsa          # Domain affiliation, users, LAPS, NTLM, and NTP
 secuditor -pwd          # Local password policy settings
 secuditor -ssl          # SSL/TLS interception and certificate trust inspection
-secuditor -sys          # System specifications and connected hardware
-secuditor -net          # Network adapters, IPs, gateways, DNS, DHCP, and Wi-Fi
+secuditor -all          # Run all audits in sequence
 ```
 
 Examples:
 
 ```bash
+secuditor -all --json
 secuditor -net --json
 secuditor --version
 ```
 
-Long flag aliases (`--domain`, `--endpoint`, `--apps`, `--password`, `--ssl`, `--system`, `--network`) are also supported.
+Long flag aliases (`--domain`, `--endpoint`, `--network`, `--apps`, `--password`, `--ssl`, `--system`, `--all`) are also supported.
 
 ## Python Library Usage
 
@@ -39,11 +41,12 @@ Audit classes are lazily loaded from `secuditor` and expose an `.audit()` method
 from secuditor import (
     DomainAudit,
     SecurityAudit,
-    InstalledApps,
     NetworkSettings,
+    InstalledApps,
     PasswordPolicy,
     SSLInterception,
     SystemSettings,
+    FullAudit,
 )
 
 report = DomainAudit().audit()

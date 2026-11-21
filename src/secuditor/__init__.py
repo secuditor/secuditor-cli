@@ -4,7 +4,7 @@
 
 from importlib import import_module
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __author__ = "Menahem Levinski"
 __license__ = "MIT"
 
@@ -14,11 +14,12 @@ __all__ = [
     "__license__",
     "DomainAudit",
     "SecurityAudit",
-    "InstalledApps",
     "NetworkSettings",
+    "InstalledApps",
     "PasswordPolicy",
     "SSLInterception",
     "SystemSettings",
+    "FullAudit",
 ]
 
 _MODULES = {
@@ -27,10 +28,10 @@ _MODULES = {
     "SecurityAudit": ".endpoint_security",
     "SecuritySettingsAudit": ".endpoint_security",
     "EndpointSecurity": ".endpoint_security",
-    "InstalledApps": ".installed_apps",
-    "InstalledAppsAudit": ".installed_apps",
     "NetworkSettings": ".network_settings",
     "NetworkSettingsAudit": ".network_settings",
+    "InstalledApps": ".installed_apps",
+    "InstalledAppsAudit": ".installed_apps",
     "PasswordPolicy": ".password_policy",
     "PasswordPolicyAudit": ".password_policy",
     "SSLInterception": ".ssl_interception",
@@ -38,6 +39,7 @@ _MODULES = {
     "SSLInspection": ".ssl_interception",
     "SystemSettings": ".system_settings",
     "SystemSettingsAudit": ".system_settings",
+    "FullAudit": ".cli",
 }
 
 

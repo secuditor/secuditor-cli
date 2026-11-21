@@ -610,13 +610,13 @@ class SecuritySettingsAudit:
             "Office Macro Policy": "Unknown",
             "Defender ASR Rules": "Unknown",
             "UAC Elevation": "Unknown",
-            "Core Isolation": "Unknown",
             "PowerShell Scripts": "Unknown",
             "Anonymous Access": "Unknown",
+            "Core Isolation": "Unknown",
             "Data Execution Prevention": "Unknown",
+            "UEFI Secure Boot": "Unknown",
             "Encrypted File System": "Unknown",
             "BitLocker Drive Encryption": "Unknown",
-            "UEFI Secure Boot": "Unknown",
             "Removable Storage": "Unknown",
             "USB AutoRun": "Unknown",
             "System Restore": "Unknown",
@@ -830,8 +830,8 @@ class SecuritySettingsAudit:
             "Host-based Firewall": "Unknown",
             "Auto Screen Lock": "Unknown",
             "Kernel Hardening (ASLR)": "Unknown",
-            "Disk Encryption": "Unknown",
             "UEFI Secure Boot": "Unknown",
+            "Disk Encryption": "Unknown",
             "Removable Storage": "Unknown",
             "System Snapshots": "Unknown",
         }
@@ -993,10 +993,10 @@ class SecuritySettingsAudit:
     def _macos_audit(self):
         result = {
             "Gatekeeper": "Unknown",
-            "System Integrity Protection": "Unknown",
             "Endpoint Protection": [],
             "Host-based Firewall": "Unknown",
             "Auto Screen Lock": "Unknown",
+            "System Integrity Protection": "Unknown",
             "FileVault Disk Encryption": "Unknown",
             "Time Machine Backups": "Unknown",
         }

@@ -12,18 +12,20 @@ class TestCLI(unittest.TestCase):
         cases = [
             ("-dsa", "dsa"),
             ("-end", "end"),
+            ("-net", "net"),
             ("-app", "app"),
             ("-pwd", "pwd"),
             ("-ssl", "ssl"),
-            ("-sys", "sys"),
-            ("-net", "net"),
+            ("-com", "com"),
+            ("-all", "all"),
             ("--domain", "dsa"),
             ("--endpoint", "end"),
+            ("--network", "net"),
             ("--apps", "app"),
             ("--password", "pwd"),
             ("--ssl", "ssl"),
-            ("--system", "sys"),
-            ("--network", "net"),
+            ("--system", "com"),
+            ("--all", "all"),
         ]
         parser = build_parser()
         for flag, expected in cases:
@@ -47,6 +49,8 @@ class TestCLI(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["-pas"])
             with self.assertRaises(SystemExit):
+                parser.parse_args(["-sys"])
+            with self.assertRaises(SystemExit):
                 parser.parse_args(["-d"])
 
     def test_main_invokes_audit_and_prints_json(self):
@@ -64,6 +68,51 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(
             json.loads(stdout.getvalue()),
             {"platform": "TestOS", "ok": True},
+        )
+
+    def test_main_all_runs_all_seven_in_requested_order(self):
+        called_order = []
+
+        def fake_import(module_name, package=None):
+            called_order.append(module_name)
+
+            class FakeAudit:
+                def audit(self):
+                    return {"module": module_name}
+
+            mod = type("FakeMod", (), {})()
+            for _, cls_name, _ in [
+                (".domain_settings", "DomainAudit", ""),
+                (".endpoint_security", "SecurityAudit", ""),
+                (".network_settings", "NetworkSettings", ""),
+                (".installed_apps", "InstalledApps", ""),
+                (".password_policy", "PasswordPolicy", ""),
+                (".ssl_interception", "SSLInterception", ""),
+                (".system_settings", "SystemSettings", ""),
+            ]:
+                setattr(mod, cls_name, FakeAudit)
+            return mod
+
+        stdout = io.StringIO()
+        with patch("secuditor.cli.import_module", side_effect=fake_import):
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(["-all", "--json"])
+
+        self.assertEqual(exit_code, 0)
+        expected_modules = [
+            ".system_settings",
+            ".endpoint_security",
+            ".network_settings",
+            ".installed_apps",
+            ".domain_settings",
+            ".password_policy",
+            ".ssl_interception",
+        ]
+        self.assertEqual(called_order, expected_modules)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            list(payload.keys()),
+            [m.lstrip(".") for m in expected_modules],
         )
 
 
