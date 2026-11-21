@@ -5,6 +5,7 @@
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 
@@ -176,7 +177,12 @@ class SystemSettingsAudit:
             for entry in entries:
                 if entry.family == getattr(psutil, "AF_LINK", object()):
                     if entry.address:
-                        mac = entry.address
+                        candidate = entry.address.strip().replace("-", ":").lower()
+                        if (
+                            re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", candidate)
+                            and candidate not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
+                        ):
+                            mac = candidate
                 elif entry.family == socket.AF_INET:
                     ips.append({
                         "address": entry.address,

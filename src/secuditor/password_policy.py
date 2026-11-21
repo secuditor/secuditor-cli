@@ -137,7 +137,7 @@ class PasswordPolicyAudit:
         NetGetJoinInformation = netapi32.NetGetJoinInformation
         NetGetJoinInformation.argtypes = [
             wintypes.LPCWSTR,
-            ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.POINTER(ctypes.c_void_p),
             ctypes.POINTER(ctypes.c_int),
         ]
         NetGetJoinInformation.restype = wintypes.DWORD
@@ -169,7 +169,7 @@ class PasswordPolicyAudit:
 
         # Check whether the host is joined to an AD domain.
         is_domain_joined = False
-        join_name_buf = wintypes.LPWSTR()
+        join_name_buf = ctypes.c_void_p()
         join_status = ctypes.c_int()
         try:
             if NetGetJoinInformation(
@@ -583,10 +583,14 @@ class PasswordPolicyAudit:
 
         import getpass
         current_user = getpass.getuser()
+        safe_user = (
+            bool(current_user)
+            and not current_user.startswith("-")
+        )
 
         # `chage -l` provides aging and account expiration data.
         chage = shutil.which("chage")
-        if chage:
+        if chage and safe_user:
             output = self._run([chage, "-l", current_user])
             if output:
                 report["current_user"] = {
@@ -616,7 +620,7 @@ class PasswordPolicyAudit:
 
         # `passwd -S` checks whether a password is set/required when permitted.
         passwd_bin = shutil.which("passwd")
-        if passwd_bin:
+        if passwd_bin and safe_user:
             output = self._run([passwd_bin, "-S", current_user])
             if output:
                 parts = output.split()

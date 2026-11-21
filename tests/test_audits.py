@@ -1,5 +1,6 @@
 import builtins
 import io
+import os
 import socket
 import types
 import unittest
@@ -12,12 +13,17 @@ from secuditor import (
     PasswordPolicy,
     SystemSettings,
 )
-from secuditor._utils import _system_exe
+from secuditor._utils import _sanitize_path_env, _system_exe
 
 
 class TestUtils(unittest.TestCase):
     def test_system_exe_leaves_non_builtin_untouched(self):
         self.assertEqual(_system_exe("custom_tool"), "custom_tool")
+
+    def test_sanitize_path_strips_relative_and_dot_segments(self):
+        abs_dir = os.path.abspath("/usr/bin")
+        raw = os.pathsep.join(["", ".", "relative/bin", abs_dir])
+        self.assertEqual(_sanitize_path_env(raw), abs_dir)
 
 
 class TestDomainAudit(unittest.TestCase):
@@ -131,6 +137,40 @@ class TestDomainAudit(unittest.TestCase):
         self.assertEqual(report["ntlm_policy"]["value"]["block_ntlmv1_sso"], 1)
         self.assertEqual(report["ntp"]["status"], "detected")
         self.assertIn("Running", report["ntp"]["value"])
+
+    def test_windows_users_net_fallback_rejects_switches_and_localized_footer(self):
+        audit = DomainAudit()
+        audit.system = "Windows"
+        report = audit._base_report()
+
+        net_user_list = (
+            "User accounts for \\\\HOST\n"
+            "-------------------------------------------------------------------------------\n"
+            "Administrator            /add                     Guest                    \n"
+            "La commande s'est terminee correctement.\n"
+        )
+        admin_detail = (
+            "User name                    Administrator\n"
+            "Account active               Yes\n"
+            "Local Group Memberships      *Administrators\n"
+        )
+        guest_detail = (
+            "User name                    Guest\n"
+            "Account active               No\n"
+            "Local Group Memberships      *Guests\n"
+        )
+
+        with patch.object(
+            audit,
+            "_run",
+            side_effect=[net_user_list, admin_detail, guest_detail],
+        ) as mock_run:
+            ok = audit._windows_users_net_fallback(report)
+
+        self.assertTrue(ok)
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(report["users"]["privileged"][0]["name"], "Administrator")
+        self.assertEqual(report["users"]["regular"][0]["name"], "Guest")
 
 
 class TestInstalledAppsAudit(unittest.TestCase):
@@ -251,6 +291,7 @@ class TestNetworkSettingsAudit(unittest.TestCase):
         self.assertEqual(by_name["Loopback"]["dhcp_servers"], {})
 
     def test_rejects_placeholder_macs_and_reports_wifi_location_block(self):
+        self.assertEqual(NetworkSettings().timeout, 8.0)
         self.assertIsNone(NetworkSettings._normalize_mac("00:00:00:00:00:00"))
         self.assertIsNone(NetworkSettings._normalize_mac("FF-FF-FF-FF-FF-FF"))
         self.assertEqual(

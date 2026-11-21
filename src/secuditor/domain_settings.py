@@ -73,7 +73,7 @@ class DomainSettingsAudit:
             NetGetJoinInformation = netapi32.NetGetJoinInformation
             NetGetJoinInformation.argtypes = [
                 wintypes.LPCWSTR,
-                ctypes.POINTER(wintypes.LPWSTR),
+                ctypes.POINTER(ctypes.c_void_p),
                 ctypes.POINTER(ctypes.c_int),
             ]
             NetGetJoinInformation.restype = wintypes.DWORD
@@ -82,7 +82,7 @@ class DomainSettingsAudit:
             NetApiBufferFree.argtypes = [ctypes.c_void_p]
             NetApiBufferFree.restype = wintypes.DWORD
 
-            name_buffer = wintypes.LPWSTR()
+            name_buffer = ctypes.c_void_p()
             join_status = ctypes.c_int()
             try:
                 if NetGetJoinInformation(
@@ -96,9 +96,14 @@ class DomainSettingsAudit:
                         2: "workgroup",
                         3: "domain",
                     }
+                    join_name = (
+                        ctypes.wstring_at(name_buffer.value)
+                        if name_buffer.value
+                        else None
+                    )
                     return (
                         status_map.get(join_status.value, "unknown"),
-                        name_buffer.value if name_buffer else None,
+                        join_name,
                     )
             finally:
                 if name_buffer:
@@ -239,6 +244,15 @@ class DomainSettingsAudit:
             return None
         return str(sid)
 
+    @staticmethod
+    def _is_safe_windows_username(name):
+        if not name or len(name) > 20:
+            return False
+        if name.startswith(("/", "-")):
+            return False
+        invalid_chars = set('/\\[:;|=,+*?<>]"')
+        return not any(ch in invalid_chars or ord(ch) < 32 for ch in name)
+
     def _windows_users_net_fallback(self, report):
         output = self._run(["net.exe", "user"])
         if not output:
@@ -253,14 +267,32 @@ class DomainSettingsAudit:
         except StopIteration:
             return False
 
-        usernames = []
-        for line in lines[sep_index + 1:]:
-            stripped = line.strip()
-            if not stripped or stripped.lower().startswith(
+        body_lines = [
+            line for line in lines[sep_index + 1:]
+            if line.strip()
+        ]
+        # Drop the trailing command completion status line.
+        if body_lines and (
+            body_lines[-1].strip().lower().startswith(
                 "the command completed successfully"
-            ):
-                continue
-            usernames.extend(stripped.split())
+            )
+            or body_lines[-1].strip().endswith(".")
+        ):
+            body_lines = body_lines[:-1]
+
+        usernames = []
+        for line in body_lines:
+            # net.exe user formats names in 25-character columns when multiple exist.
+            if len(line) >= 25 and "  " in line:
+                candidates = [
+                    line[i:i + 25].strip()
+                    for i in range(0, len(line), 25)
+                ]
+            else:
+                candidates = line.split()
+            for candidate in candidates:
+                if self._is_safe_windows_username(candidate):
+                    usernames.append(candidate)
 
         if not usernames:
             return False

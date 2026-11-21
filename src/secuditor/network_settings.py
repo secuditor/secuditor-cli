@@ -18,7 +18,7 @@ __all__ = ["NetworkSettings", "NetworkSettingsAudit"]
 class NetworkSettingsAudit:
     """Collect local network configuration on Windows, Linux, and macOS."""
 
-    def __init__(self, timeout=3.0):
+    def __init__(self, timeout=8.0):
         self.timeout = timeout
         self.system = platform.system()
 
@@ -248,14 +248,12 @@ class NetworkSettingsAudit:
         servers = []
 
         if self.system == "Windows":
-            output = self._run([
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
+            output = run_powershell(
                 "Get-DnsClientServerAddress "
                 "| ForEach-Object { $_.ServerAddresses }",
-            ])
+                timeout=self.timeout,
+                parse_json=False,
+            )
             if output:
                 for line in output.splitlines():
                     value = line.strip()
@@ -399,28 +397,24 @@ class NetworkSettingsAudit:
         servers = {}
 
         if self.system == "Windows":
-            output = self._run([
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
+            adapters = run_powershell(
                 "Get-CimInstance Win32_NetworkAdapterConfiguration "
                 "-Filter 'IPEnabled=True' "
                 "| Select-Object Description, DHCPServer "
                 "| ConvertTo-Json -Compress",
-            ])
-            if output:
-                try:
-                    adapters = json.loads(output)
-                    if isinstance(adapters, dict):
-                        adapters = [adapters]
-                    for adapter in adapters:
-                        name = adapter.get("Description")
-                        server = adapter.get("DHCPServer")
-                        if name and server:
-                            servers[name] = [server]
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+                timeout=self.timeout,
+                parse_json=True,
+            )
+            if isinstance(adapters, dict):
+                adapters = [adapters]
+            if isinstance(adapters, list):
+                for adapter in adapters:
+                    if not isinstance(adapter, dict):
+                        continue
+                    name = adapter.get("Description")
+                    server = adapter.get("DHCPServer")
+                    if name and server:
+                        servers[name] = [server]
 
         elif self.system == "Linux":
             if shutil.which("nmcli"):

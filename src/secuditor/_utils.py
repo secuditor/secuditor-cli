@@ -71,11 +71,27 @@ def _system_exe(name: str) -> str:
     return shutil.which(name) or name
 
 
+def _sanitize_path_env(raw_path: str | None) -> str:
+    """Remove empty and relative directory entries (such as '.') from PATH."""
+    if not raw_path:
+        return "" if _IS_WINDOWS else "/usr/sbin:/usr/bin:/sbin:/bin"
+    safe_parts = [
+        part
+        for part in raw_path.split(os.pathsep)
+        if part and part != "." and os.path.isabs(part)
+    ]
+    if not safe_parts and not _IS_WINDOWS:
+        return "/usr/sbin:/usr/bin:/sbin:/bin"
+    return os.pathsep.join(safe_parts)
+
+
 def _safe_subproc_env() -> dict[str, str]:
-    """Return a subprocess environment hardened against CWD exe lookup on Windows."""
+    """Return a subprocess environment hardened against CWD/relative PATH lookup."""
     env = dict(os.environ)
     if _IS_WINDOWS:
         env.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
+    if "PATH" in env or not _IS_WINDOWS:
+        env["PATH"] = _sanitize_path_env(env.get("PATH"))
     return env
 
 
