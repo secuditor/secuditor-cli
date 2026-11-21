@@ -61,3 +61,7 @@ print(report["affiliation"])
 ## License
 
 MIT License — see [LICENSE](https://github.com/secuditor/secuditor-cli/blob/main/LICENSE) for details.
+
+## Info
+
+Website: [secuditor.com](https://secuditor.com/)
