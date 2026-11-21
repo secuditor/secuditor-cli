@@ -134,6 +134,7 @@ _SECTION_DIVIDER_KEYS = {
     "Disks",
     "hardware",
     "adapters",
+    "applications",
     "errors",
     "notes",
     "checks",
@@ -158,6 +159,103 @@ _SECTION_DIVIDER_KEYS = {
     "ssl_interception_detected",
 }
 
+_LABEL_REPLACEMENTS = {
+    "os": "OS",
+    "cpu": "CPU",
+    "mhz": "MHz",
+    "ram": "RAM",
+    "gb": "GB",
+    "usb": "USB",
+    "asr": "ASR",
+    "uac": "UAC",
+    "powershell": "PowerShell",
+    "bitlocker": "BitLocker",
+    "uefi": "UEFI",
+    "autorun": "AutoRun",
+    "ip": "IP",
+    "mac": "MAC",
+    "dns": "DNS",
+    "dhcp": "DHCP",
+    "wifi": "Wi-Fi",
+    "laps": "LAPS",
+    "ntlm": "NTLM",
+    "ntlmv1": "NTLMv1",
+    "lm": "LM",
+    "sso": "SSO",
+    "ntp": "NTP",
+    "sid": "SID",
+    "san": "SAN",
+    "sha256": "SHA256",
+    "tls": "TLS",
+    "ssl": "SSL",
+    "aslr": "ASLR",
+    "filevault": "FileVault",
+}
+
+
+def _format_label(key: str) -> str:
+    """Format a report dictionary key for readable plain-text output."""
+    raw = str(key)
+    if ":\\" in raw or raw.startswith("/"):
+        return raw
+
+    words = raw.replace("_", " ").split()
+    formatted = []
+    for word in words:
+        prefix = ""
+        suffix = ""
+        core = word
+        while core and core[0] in "([":
+            prefix += core[0]
+            core = core[1:]
+        while core and core[-1] in ")]":
+            suffix = core[-1] + suffix
+            core = core[:-1]
+
+        low = core.lower()
+        if low in _LABEL_REPLACEMENTS:
+            formatted.append(f"{prefix}{_LABEL_REPLACEMENTS[low]}{suffix}")
+        elif "-" in core:
+            parts = core.split("-")
+            fixed_parts = [
+                _LABEL_REPLACEMENTS.get(p.lower(), p.capitalize())
+                for p in parts
+            ]
+            formatted.append(f"{prefix}{'-'.join(fixed_parts)}{suffix}")
+        else:
+            formatted.append(f"{prefix}{core.capitalize()}{suffix}")
+    return " ".join(formatted)
+
+
+def _print_entry(
+    key: str,
+    item,
+    indent: int,
+    first_prefix: str | None = None,
+) -> None:
+    """Print a single dictionary key/value pair with proper indentation."""
+    prefix = first_prefix if first_prefix is not None else (" " * indent)
+    label = _format_label(key)
+
+    if isinstance(item, dict):
+        # Unwrap redundant single nested key matching parent (e.g. hardware -> Hardware).
+        if len(item) == 1:
+            only_key = next(iter(item))
+            if str(only_key).lower() == str(key).lower() and isinstance(item[only_key], dict):
+                item = item[only_key]
+        print(f"{prefix}{label}:")
+        _print_value(item, indent + 2, parent_key=str(key))
+    elif isinstance(item, (list, tuple)):
+        print(f"{prefix}{label}:")
+        _print_value(item, indent + 2, parent_key=str(key))
+    elif isinstance(item, str) and "\n" in item:
+        print(f"{prefix}{label}:")
+        line_prefix = " " * (indent + 2)
+        for line in item.splitlines():
+            print(f"{line_prefix}{line}")
+    else:
+        print(f"{prefix}{label}: {item}")
+
 
 def _print_value(value, indent: int = 0, parent_key: str | None = None) -> None:
     """Print nested dicts/lists in a readable plain-text layout."""
@@ -169,12 +267,7 @@ def _print_value(value, indent: int = 0, parent_key: str | None = None) -> None:
         for key, item in value.items():
             if key in _SECTION_DIVIDER_KEYS and indent in (0, 2):
                 print("–" * 50)
-            label = str(key).replace("_", " ").title()
-            if isinstance(item, (dict, list, tuple)):
-                print(f"{prefix}{label}:")
-                _print_value(item, indent + 2, parent_key=str(key))
-            else:
-                print(f"{prefix}{label}: {item}")
+            _print_entry(key, item, indent)
     elif isinstance(value, (list, tuple)):
         if not value:
             print(f"{prefix}(none)")
@@ -182,7 +275,21 @@ def _print_value(value, indent: int = 0, parent_key: str | None = None) -> None:
         for idx, item in enumerate(value):
             if idx > 0 and parent_key == "adapters":
                 print("–" * 50)
-            if isinstance(item, (dict, list, tuple)):
+            if isinstance(item, dict):
+                if not item:
+                    print(f"{prefix}- (none)")
+                    continue
+                items = list(item.items())
+                first_key, first_val = items[0]
+                _print_entry(
+                    first_key,
+                    first_val,
+                    indent + 2,
+                    first_prefix=f"{prefix}- ",
+                )
+                for sub_key, sub_val in items[1:]:
+                    _print_entry(sub_key, sub_val, indent + 2)
+            elif isinstance(item, (list, tuple)):
                 print(f"{prefix}-")
                 _print_value(item, indent + 2, parent_key=parent_key)
             else:

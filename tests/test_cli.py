@@ -4,7 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from secuditor.cli import build_parser, main
+from secuditor.cli import build_parser, main, print_results
 
 
 class TestCLI(unittest.TestCase):
@@ -114,6 +114,30 @@ class TestCLI(unittest.TestCase):
             list(payload.keys()),
             [m.lstrip(".") for m in expected_modules],
         )
+
+    def test_print_results_formats_inline_list_dicts_multiline_and_acronyms(self):
+        sample = {
+            "adapters": [
+                {
+                    "name": "Ethernet 2",
+                    "mac_address": "aa:bb:cc:dd:ee:ff",
+                    "addresses": [
+                        {"ip": "192.168.1.10", "version": 4},
+                    ],
+                }
+            ],
+            "ntp": {"value": "Line 1\nLine 2"},
+            "hardware": {"Hardware": {"Printers": {"status": "available", "devices": []}}},
+        }
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            print_results("Sample", sample, as_json=False)
+        rendered = stdout.getvalue()
+        self.assertIn("  - Name: Ethernet 2", rendered)
+        self.assertIn("    MAC Address: aa:bb:cc:dd:ee:ff", rendered)
+        self.assertIn("      - IP: 192.168.1.10", rendered)
+        self.assertIn("    Line 1\n    Line 2", rendered)
+        self.assertIn("Hardware:\n  Printers:", rendered)
 
 
 if __name__ == "__main__":
