@@ -12,12 +12,12 @@ class TestCLI(unittest.TestCase):
         cases = [
             ("-dsa", "dsa"),
             ("-app", "app"),
-            ("-pas", "pas"),
+            ("-pwd", "pwd"),
             ("-sys", "sys"),
             ("-net", "net"),
             ("--domain", "dsa"),
             ("--apps", "app"),
-            ("--password", "pas"),
+            ("--password", "pwd"),
             ("--system", "sys"),
             ("--network", "net"),
         ]
@@ -40,6 +40,8 @@ class TestCLI(unittest.TestCase):
                 parser.parse_args([])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["-dsa", "-net"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["-pas"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["-end"])
             with self.assertRaises(SystemExit):

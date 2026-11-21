@@ -13,7 +13,7 @@ from . import __version__
 _AUDIT_SPECS = {
     "dsa": (".domain_settings", "DomainAudit", "Domain Settings Audit"),
     "app": (".installed_apps", "InstalledApps", "Installed Applications Audit"),
-    "pas": (".password_policy", "PasswordPolicy", "Password Policy Audit"),
+    "pwd": (".password_policy", "PasswordPolicy", "Password Policy Audit"),
     "sys": (".system_settings", "SystemSettings", "System Settings Audit"),
     "net": (".network_settings", "NetworkSettings", "Network Settings Audit"),
 }
@@ -57,11 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit installed applications",
     )
     group.add_argument(
-        "-pas",
+        "-pwd",
         "--password",
         dest="audit",
         action="store_const",
-        const="pas",
+        const="pwd",
         help="Audit password policy",
     )
     group.add_argument(

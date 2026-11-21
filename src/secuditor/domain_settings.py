@@ -3,7 +3,9 @@
 """Cross-platform domain affiliation and identity configuration discovery."""
 
 import json
+import os
 import platform
+import re
 import shutil
 
 from ._utils import read_registry_value, run_command, run_powershell
@@ -61,37 +63,115 @@ class DomainSettingsAudit:
     def _windows_registry_value(self, path, name):
         return read_registry_value("HKLM", path, name)
 
+    def _windows_join_info(self):
+        """Read domain/workgroup join state via Win32 NetGetJoinInformation."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            netapi32 = ctypes.windll.netapi32
+            NetGetJoinInformation = netapi32.NetGetJoinInformation
+            NetGetJoinInformation.argtypes = [
+                wintypes.LPCWSTR,
+                ctypes.POINTER(wintypes.LPWSTR),
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            NetGetJoinInformation.restype = wintypes.DWORD
+
+            NetApiBufferFree = netapi32.NetApiBufferFree
+            NetApiBufferFree.argtypes = [ctypes.c_void_p]
+            NetApiBufferFree.restype = wintypes.DWORD
+
+            name_buffer = wintypes.LPWSTR()
+            join_status = ctypes.c_int()
+            try:
+                if NetGetJoinInformation(
+                    None,
+                    ctypes.byref(name_buffer),
+                    ctypes.byref(join_status),
+                ) == 0:
+                    status_map = {
+                        0: "unknown",
+                        1: "unjoined",
+                        2: "workgroup",
+                        3: "domain",
+                    }
+                    return (
+                        status_map.get(join_status.value, "unknown"),
+                        name_buffer.value if name_buffer else None,
+                    )
+            finally:
+                if name_buffer:
+                    NetApiBufferFree(name_buffer)
+        except (ImportError, AttributeError, OSError):
+            pass
+        return None, None
+
+    def _is_windows_domain_controller(self):
+        product_type = self._windows_registry_value(
+            r"SYSTEM\CurrentControlSet\Control\ProductOptions",
+            "ProductType",
+        )
+        return (
+            isinstance(product_type, str)
+            and product_type.strip().casefold() == "lanmannt"
+        )
+
     def _windows_affiliation(self, report):
-        # CIM is used to retrieve computer domain membership and role.
+        domain = None
+        join_state, join_name = self._windows_join_info()
+        if join_state == "domain":
+            domain = join_name
+            report["affiliation"] = {
+                "status": "detected",
+                "value": {
+                    "type": "Active Directory domain",
+                    "name": domain,
+                },
+                "source": "NetGetJoinInformation",
+            }
+        elif join_state in ("workgroup", "unjoined"):
+            domain = join_name
+            report["affiliation"] = {
+                "status": "detected",
+                "value": {
+                    "type": "workgroup or standalone",
+                    "name": domain,
+                },
+                "source": "NetGetJoinInformation",
+            }
+
+        # CIM is used to retrieve computer domain role and fallback membership.
         computer = self._powershell(
             "Get-CimInstance Win32_ComputerSystem | "
             "Select-Object Name,Domain,PartOfDomain,DomainRole | "
             "ConvertTo-Json -Compress"
         )
-        domain = None
 
         if isinstance(computer, dict):
             joined = computer.get("PartOfDomain")
-            domain = computer.get("Domain")
+            cim_domain = computer.get("Domain")
+            domain = domain or cim_domain
 
-            if joined is True:
-                report["affiliation"] = {
-                    "status": "detected",
-                    "value": {
-                        "type": "Active Directory domain",
-                        "name": domain,
-                    },
-                    "source": "Win32_ComputerSystem",
-                }
-            elif joined is False:
-                report["affiliation"] = {
-                    "status": "detected",
-                    "value": {
-                        "type": "workgroup or standalone",
-                        "name": domain,
-                    },
-                    "source": "Win32_ComputerSystem",
-                }
+            if report["affiliation"]["status"] == "unknown":
+                if joined is True:
+                    report["affiliation"] = {
+                        "status": "detected",
+                        "value": {
+                            "type": "Active Directory domain",
+                            "name": cim_domain,
+                        },
+                        "source": "Win32_ComputerSystem",
+                    }
+                elif joined is False:
+                    report["affiliation"] = {
+                        "status": "detected",
+                        "value": {
+                            "type": "workgroup or standalone",
+                            "name": cim_domain,
+                        },
+                        "source": "Win32_ComputerSystem",
+                    }
 
             role = computer.get("DomainRole")
             if isinstance(role, int):
@@ -102,6 +182,12 @@ class DomainSettingsAudit:
                     ),
                     "source": "Win32_ComputerSystem",
                 }
+        elif self._is_windows_domain_controller():
+            report["domain_role"] = {
+                "status": "detected",
+                "value": "Domain Controller",
+                "source": "Windows registry",
+            }
 
         # Entra ID and hybrid join are independent signals.
         dsreg = self._run(["dsregcmd.exe", "/status"])
@@ -153,6 +239,60 @@ class DomainSettingsAudit:
             return None
         return str(sid)
 
+    def _windows_users_net_fallback(self, report):
+        output = self._run(["net.exe", "user"])
+        if not output:
+            return False
+
+        lines = output.splitlines()
+        try:
+            sep_index = next(
+                i for i, line in enumerate(lines)
+                if line.strip().startswith("---")
+            )
+        except StopIteration:
+            return False
+
+        usernames = []
+        for line in lines[sep_index + 1:]:
+            stripped = line.strip()
+            if not stripped or stripped.lower().startswith(
+                "the command completed successfully"
+            ):
+                continue
+            usernames.extend(stripped.split())
+
+        if not usernames:
+            return False
+
+        for name in usernames:
+            enabled = None
+            is_admin = False
+            detail = self._run(["net.exe", "user", name])
+            if detail:
+                active_match = re.search(
+                    r"Account active\s+(\w+)", detail, re.IGNORECASE
+                )
+                if active_match:
+                    enabled = active_match.group(1).strip().lower() == "yes"
+                groups = re.findall(r"Local Group Memberships\s+(.*)", detail)
+                if groups and "Administrators" in groups[0]:
+                    is_admin = True
+
+            item = {
+                "name": name,
+                "enabled": enabled,
+                "sid": None,
+                "administrator_member": is_admin,
+            }
+            if is_admin:
+                report["users"]["privileged"].append(item)
+            else:
+                report["users"]["regular"].append(item)
+
+        report["users"]["status"] = "detected"
+        return True
+
     def _windows_users(self, report):
         # Get-LocalUser and Get-LocalGroupMember may be unavailable
         # on some Windows editions or in constrained environments.
@@ -170,9 +310,10 @@ class DomainSettingsAudit:
         )
 
         if users is None:
-            report["limitations"].append(
-                "Local user enumeration was unavailable."
-            )
+            if not self._windows_users_net_fallback(report):
+                report["limitations"].append(
+                    "Local user enumeration was unavailable."
+                )
             return
 
         if isinstance(users, dict):
@@ -215,20 +356,9 @@ class DomainSettingsAudit:
         report["users"]["status"] = "detected"
 
     def _windows_laps(self, report):
-        # Legacy LAPS policy and Windows LAPS policy are distinct.
-        legacy_path = (
-            r"SOFTWARE\Policies\Microsoft Services\AdmPwd"
-        )
-        windows_laps_path = (
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config"
-        )
-
-        legacy = self._windows_registry_value(
-            legacy_path, "AdmPwdEnabled"
-        )
-        backup = self._windows_registry_value(
-            windows_laps_path, "BackupDirectory"
-        )
+        # Legacy LAPS policy and Windows LAPS policy (Policies + Config) are distinct.
+        legacy_path = r"SOFTWARE\Policies\Microsoft Services\AdmPwd"
+        legacy = self._windows_registry_value(legacy_path, "AdmPwdEnabled")
 
         policies = []
 
@@ -238,12 +368,20 @@ class DomainSettingsAudit:
                 "configured": bool(legacy),
             })
 
-        if backup is not None:
-            policies.append({
-                "product": "Windows LAPS",
-                "backup_directory": backup,
-                "configured": backup in (1, 2),
-            })
+        for win_laps_path in (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS",
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config",
+        ):
+            backup = self._windows_registry_value(
+                win_laps_path, "BackupDirectory"
+            )
+            if backup is not None:
+                policies.append({
+                    "product": "Windows LAPS",
+                    "path": win_laps_path,
+                    "backup_directory": backup,
+                    "configured": backup in (1, 2),
+                })
 
         if policies:
             report["laps"] = {
@@ -266,17 +404,36 @@ class DomainSettingsAudit:
         lsa = r"SYSTEM\CurrentControlSet\Control\Lsa"
         msv = lsa + r"\MSV1_0"
 
-        lm_level = self._windows_registry_value(
-            lsa, "LmCompatibilityLevel"
+        lm_level = self._windows_registry_value(lsa, "LmCompatibilityLevel")
+        no_lm_hash = self._windows_registry_value(lsa, "NoLMHash")
+        audit = self._windows_registry_value(msv, "AuditReceivingNTLMTraffic")
+        restrict_sending = self._windows_registry_value(
+            msv, "RestrictSendingNTLMTraffic"
         )
-        no_lm_hash = self._windows_registry_value(
-            lsa, "NoLMHash"
+        if restrict_sending is None:
+            restrict_sending = self._windows_registry_value(
+                lsa, "RestrictSendingNTLMTraffic"
+            )
+        restrict_receiving = self._windows_registry_value(
+            msv, "RestrictReceivingNTLMTraffic"
         )
-        audit = self._windows_registry_value(
-            msv, "AuditReceivingNTLMTraffic"
-        )
+        if restrict_receiving is None:
+            restrict_receiving = self._windows_registry_value(
+                lsa, "RestrictReceivingNTLMTraffic"
+            )
+        block_ntlmv1_sso = self._windows_registry_value(lsa, "BlockNtlmv1SSO")
 
-        if lm_level is None:
+        if all(
+            v is None
+            for v in (
+                lm_level,
+                no_lm_hash,
+                audit,
+                restrict_sending,
+                restrict_receiving,
+                block_ntlmv1_sso,
+            )
+        ):
             report["ntlm_policy"] = {
                 "status": "unknown",
                 "value": None,
@@ -297,11 +454,16 @@ class DomainSettingsAudit:
             "status": "detected",
             "value": {
                 "lm_compatibility_level": lm_level,
-                "description": descriptions.get(
-                    lm_level, "Unknown configuration"
+                "description": (
+                    descriptions.get(lm_level, "Unknown configuration")
+                    if lm_level is not None
+                    else "Not explicitly configured"
                 ),
                 "no_lm_hash": no_lm_hash,
                 "audit_receiving_ntlm_traffic": audit,
+                "restrict_sending_ntlm_traffic": restrict_sending,
+                "restrict_receiving_ntlm_traffic": restrict_receiving,
+                "block_ntlmv1_sso": block_ntlmv1_sso,
             },
             "source": "Windows registry",
         }
@@ -314,6 +476,31 @@ class DomainSettingsAudit:
                 "status": "detected",
                 "value": output,
                 "source": "w32tm",
+            }
+            return
+
+        sc_out = self._run(["sc.exe", "query", "w32time"])
+        if sc_out:
+            upper_out = sc_out.upper()
+            if "RUNNING" in upper_out:
+                state = "Running"
+                announce = self._windows_registry_value(
+                    r"SYSTEM\CurrentControlSet\Services\W32Time\Config",
+                    "AnnounceFlags",
+                )
+                if announce in (5, 10) and self._is_windows_domain_controller():
+                    state += " (Domain NTP Server)"
+            elif "STOPPED" in upper_out:
+                state = "Stopped"
+            elif "DISABLED" in upper_out:
+                state = "Disabled"
+            else:
+                state = "Unknown"
+
+            report["ntp"] = {
+                "status": "detected",
+                "value": f"Windows Time service is {state}",
+                "source": "sc query w32time",
             }
         else:
             report["ntp"] = {
@@ -336,6 +523,25 @@ class DomainSettingsAudit:
                 },
                 "source": "realm list",
             }
+        elif os.path.isfile("/etc/sssd/sssd.conf"):
+            report["affiliation"] = {
+                "status": "detected",
+                "value": {
+                    "type": "SSSD configured",
+                    "details": "/etc/sssd/sssd.conf present",
+                },
+                "source": "/etc/sssd/sssd.conf",
+            }
+        elif shutil.which("wbinfo") and self._run(["wbinfo", "-p"]) is not None:
+            domain_name = self._run(["wbinfo", "--own-domain"])
+            report["affiliation"] = {
+                "status": "detected",
+                "value": {
+                    "type": "Winbind domain",
+                    "details": domain_name or "Winbind daemon reachable",
+                },
+                "source": "wbinfo",
+            }
         else:
             report["affiliation"] = {
                 "status": "unknown",
@@ -343,8 +549,8 @@ class DomainSettingsAudit:
                 "source": "realmd",
             }
             report["limitations"].append(
-                "No realm membership was returned. This does not rule "
-                "out LDAP, SSSD, Winbind, or other directory integration."
+                "No realm, SSSD, or Winbind membership was returned. This "
+                "does not rule out LDAP or other directory integration."
             )
 
         self._linux_users(report)
@@ -524,6 +730,8 @@ class DomainSettingsAudit:
         for name in output.splitlines():
             name = name.strip()
             if not name:
+                continue
+            if name.startswith("_") and name not in admins:
                 continue
 
             item = {"name": name}

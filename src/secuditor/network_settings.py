@@ -6,11 +6,12 @@ import ipaddress
 import json
 import platform
 import re
+import shutil
 import socket
 
 import psutil
 
-from ._utils import run_command, run_powershell
+from ._utils import run_command, run_command_result, run_powershell
 
 __all__ = ["NetworkSettings", "NetworkSettingsAudit"]
 
@@ -46,7 +47,10 @@ class NetworkSettingsAudit:
         if not mac:
             return None
         mac = mac.strip().replace("-", ":").lower()
-        if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+        if (
+            re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac)
+            and mac not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
+        ):
             return mac
         return None
 
@@ -105,41 +109,79 @@ class NetworkSettingsAudit:
 
         return result
 
-    def _default_gateways(self):
+    def _windows_network_ps_data(self):
+        """Collect Windows routes, DNS, DHCP, and Wi-Fi adapters in one PowerShell call."""
+        if self.system != "Windows":
+            return None
+
+        script = (
+            "$adapters = @{}; "
+            "Get-CimInstance Win32_NetworkAdapter "
+            "| Where-Object { $_.NetConnectionID } "
+            "| ForEach-Object { $adapters[$_.InterfaceIndex] = $_.NetConnectionID }; "
+            "$dhcp = @(Get-CimInstance Win32_NetworkAdapterConfiguration "
+            "-Filter 'IPEnabled=True' | ForEach-Object { "
+            "[PSCustomObject]@{ "
+            "Alias = $adapters[$_.InterfaceIndex]; "
+            "Description = $_.Description; "
+            "DHCPServer = $_.DHCPServer "
+            "} }); "
+            "$routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' "
+            "-ErrorAction SilentlyContinue "
+            "| Select-Object InterfaceAlias,NextHop); "
+            "$dns = @(Get-DnsClientServerAddress -ErrorAction SilentlyContinue "
+            "| Select-Object InterfaceAlias,ServerAddresses); "
+            "$wifi = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.InterfaceDescription -match 'Wireless|Wi-Fi' } "
+            "| Select-Object Name,Status); "
+            "[PSCustomObject]@{ "
+            "routes = $routes; dns = $dns; dhcp = $dhcp; wifi = $wifi "
+            "} | ConvertTo-Json -Depth 4 -Compress"
+        )
+        data = run_powershell(script, timeout=self.timeout, parse_json=True)
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _parse_windows_gateways(routes):
+        gateways = {}
+        if isinstance(routes, dict):
+            routes = [routes]
+        if not isinstance(routes, list):
+            return gateways
+
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            interface = route.get("InterfaceAlias")
+            gateway = route.get("NextHop")
+            if interface and gateway:
+                try:
+                    ip_obj = ipaddress.ip_address(gateway)
+                    if not ip_obj.is_unspecified:
+                        gateways.setdefault(interface, []).append(gateway)
+                except ValueError:
+                    continue
+
+        for name in gateways:
+            gateways[name] = list(dict.fromkeys(gateways[name]))
+        return gateways
+
+    def _default_gateways(self, ps_routes=None):
         gateways = {}
 
         if self.system == "Windows":
-            output = self._run([
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
+            if ps_routes is not None:
+                return self._parse_windows_gateways(ps_routes)
+
+            routes = run_powershell(
                 "Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' "
                 "| Select-Object InterfaceAlias,NextHop "
                 "| ConvertTo-Json -Compress",
-            ])
-
-            if output:
-                try:
-                    routes = json.loads(output)
-                    if isinstance(routes, dict):
-                        routes = [routes]
-
-                    for route in routes:
-                        interface = route.get("InterfaceAlias")
-                        gateway = route.get("NextHop")
-                        if interface and gateway:
-                            try:
-                                ipaddress.ip_address(gateway)
-                                if not ipaddress.ip_address(gateway).is_unspecified:
-                                    gateways.setdefault(interface, []).append(
-                                        gateway
-                                    )
-                            except ValueError:
-                                continue
-                    return gateways
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+                timeout=self.timeout,
+                parse_json=True,
+            )
+            if routes is not None:
+                return self._parse_windows_gateways(routes)
 
         elif self.system == "Linux":
             output = self._run(["ip", "route", "show", "default"])
@@ -249,16 +291,20 @@ class NetworkSettingsAudit:
 
         return list(dict.fromkeys(servers))
 
-    def _dns_servers_by_adapter(self):
+    def _dns_servers_by_adapter(self, ps_dns=None):
         if self.system != "Windows":
             return None
 
-        data = run_powershell(
-            "Get-DnsClientServerAddress "
-            "| Select-Object InterfaceAlias,ServerAddresses "
-            "| ConvertTo-Json -Compress",
-            timeout=self.timeout,
-            parse_json=True,
+        data = (
+            ps_dns
+            if ps_dns is not None
+            else run_powershell(
+                "Get-DnsClientServerAddress "
+                "| Select-Object InterfaceAlias,ServerAddresses "
+                "| ConvertTo-Json -Compress",
+                timeout=self.timeout,
+                parse_json=True,
+            )
         )
         if data is None:
             return None
@@ -291,24 +337,28 @@ class NetworkSettingsAudit:
                         existing.append(ip)
         return by_adapter
 
-    def _dhcp_servers_by_adapter(self):
+    def _dhcp_servers_by_adapter(self, ps_dhcp=None):
         if self.system != "Windows":
             return None
 
-        data = run_powershell(
-            "$adapters = @{}; "
-            "Get-CimInstance Win32_NetworkAdapter "
-            "| Where-Object { $_.NetConnectionID } "
-            "| ForEach-Object { $adapters[$_.InterfaceIndex] = $_.NetConnectionID }; "
-            "Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' "
-            "| ForEach-Object { "
-            "[PSCustomObject]@{ "
-            "Alias = $adapters[$_.InterfaceIndex]; "
-            "Description = $_.Description; "
-            "DHCPServer = $_.DHCPServer "
-            "} } | ConvertTo-Json -Compress",
-            timeout=self.timeout,
-            parse_json=True,
+        data = (
+            ps_dhcp
+            if ps_dhcp is not None
+            else run_powershell(
+                "$adapters = @{}; "
+                "Get-CimInstance Win32_NetworkAdapter "
+                "| Where-Object { $_.NetConnectionID } "
+                "| ForEach-Object { $adapters[$_.InterfaceIndex] = $_.NetConnectionID }; "
+                "Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' "
+                "| ForEach-Object { "
+                "[PSCustomObject]@{ "
+                "Alias = $adapters[$_.InterfaceIndex]; "
+                "Description = $_.Description; "
+                "DHCPServer = $_.DHCPServer "
+                "} } | ConvertTo-Json -Compress",
+                timeout=self.timeout,
+                parse_json=True,
+            )
         )
         if data is None:
             return None
@@ -373,60 +423,155 @@ class NetworkSettingsAudit:
                     pass
 
         elif self.system == "Linux":
-            # DHCP lease storage varies by network manager and distribution.
-            # Do not infer a DHCP server from a local lease without parsing
-            # the format belonging to the active network manager.
-
-            pass
+            if shutil.which("nmcli"):
+                output = self._run([
+                    "nmcli", "-t", "-f", "GENERAL.DEVICE,DHCP4.OPTION", "dev", "show"
+                ])
+                if output:
+                    current_dev = None
+                    for line in output.splitlines():
+                        if line.startswith("GENERAL.DEVICE:"):
+                            current_dev = line.split(":", 1)[1].strip()
+                        elif (
+                            current_dev
+                            and "dhcp_server_identifier" in line
+                            and "=" in line
+                        ):
+                            server = line.split("=", 1)[1].strip()
+                            try:
+                                ipaddress.ip_address(server)
+                                servers[current_dev] = [server]
+                            except ValueError:
+                                pass
 
         elif self.system == "Darwin":
-            # DHCP lease files are managed by macOS and can require elevated
-            # permissions. Avoid assuming a lease file exists or is readable.
-            pass
+            # `ipconfig getpacket <iface>` exposes DHCP options without root.
+            for iface in psutil.net_if_addrs():
+                output = self._run(["ipconfig", "getpacket", iface])
+                if not output:
+                    continue
+                match = re.search(
+                    r"server_identifier\s*\(ip\)\s*:\s*(\S+)", output
+                )
+                if match:
+                    server = match.group(1).strip()
+                    try:
+                        ipaddress.ip_address(server)
+                        servers[iface] = [server]
+                    except ValueError:
+                        pass
 
         return servers
 
-    def _wifi_info(self):
+    def _wifi_info(self, ps_wifi=None):
         if self.system == "Windows":
-            output = self._run(["netsh", "wlan", "show", "interfaces"])
-            if output:
-                interfaces = []
-                current = {}
+            result = run_command_result(
+                ["netsh", "wlan", "show", "interfaces"],
+                timeout=self.timeout,
+            )
+            interfaces = []
+            unavailable_reason = None
 
-                for line in output.splitlines():
-                    if ":" not in line:
-                        continue
-                    key, value = line.strip().split(":", 1)
-                    key = key.strip().lower()
-                    value = value.strip()
+            if result is not None:
+                rc, stdout, stderr = result
+                combined = f"{stdout}\n{stderr}".lower()
+                if (
+                    "location permission" in combined
+                    or "access is denied" in combined
+                    or "error 5" in combined
+                ):
+                    unavailable_reason = "Location permission required"
+                elif rc == 0 and stdout:
+                    current = {}
+                    for line in stdout.splitlines():
+                        if ":" not in line:
+                            continue
+                        key, value = line.strip().split(":", 1)
+                        key = key.strip().lower()
+                        value = value.strip()
 
-                    if key == "name":
-                        if current:
-                            interfaces.append(current)
-                        current = {"name": value}
-                    elif key == "state":
-                        current["status"] = value
-                    elif key == "ssid":
-                        current["ssid"] = value
+                        if key == "name":
+                            if current:
+                                interfaces.append(current)
+                            current = {"name": value}
+                        elif key == "state":
+                            current["status"] = value
+                        elif key == "ssid":
+                            current["ssid"] = value
 
-                if current:
-                    interfaces.append(current)
+                    if current:
+                        interfaces.append(current)
 
+            if interfaces:
+                if unavailable_reason:
+                    for item in interfaces:
+                        item.setdefault("ssid", None)
+                        item["note"] = unavailable_reason
                 return interfaces
 
+            if ps_wifi is not None:
+                wifi_list = [ps_wifi] if isinstance(ps_wifi, dict) else ps_wifi
+                if isinstance(wifi_list, list) and wifi_list:
+                    fallback = []
+                    for adapter in wifi_list:
+                        if not isinstance(adapter, dict):
+                            continue
+                        name = adapter.get("Name")
+                        if not name:
+                            continue
+                        entry = {
+                            "name": name,
+                            "status": str(adapter.get("Status") or "unknown").lower(),
+                            "ssid": None,
+                        }
+                        if unavailable_reason:
+                            entry["note"] = unavailable_reason
+                        fallback.append(entry)
+                    return fallback or None
+
+            return None
+
         elif self.system == "Linux":
-            output = self._run(["iw", "dev"])
+            output = self._run(["iw", "dev"]) if shutil.which("iw") else None
             if output:
                 interfaces = []
                 for line in output.splitlines():
                     parts = line.split()
                     if len(parts) >= 2 and parts[0] == "Interface":
+                        iface = parts[1]
+                        status = "unknown"
+                        ssid = None
+                        link_out = self._run(["iw", "dev", iface, "link"])
+                        if link_out:
+                            if "Not connected." in link_out:
+                                status = "disconnected"
+                            elif "Connected to" in link_out:
+                                status = "connected"
+                                m = re.search(r"^\s*SSID:\s*(.+)$", link_out, re.MULTILINE)
+                                if m:
+                                    ssid = m.group(1).strip()
                         interfaces.append({
-                            "name": parts[1],
-                            "status": "unknown",
-                            "ssid": None,
+                            "name": iface,
+                            "status": status,
+                            "ssid": ssid,
                         })
                 return interfaces
+
+            if shutil.which("nmcli"):
+                nm_out = self._run([
+                    "nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev"
+                ])
+                if nm_out:
+                    interfaces = []
+                    for line in nm_out.splitlines():
+                        parts = line.split(":", 3)
+                        if len(parts) == 4 and parts[1] == "wifi":
+                            interfaces.append({
+                                "name": parts[0],
+                                "status": parts[2],
+                                "ssid": parts[3] if parts[3] not in ("", "--") else None,
+                            })
+                    return interfaces or None
 
         elif self.system == "Darwin":
             # macOS has no stable built-in CLI for Wi-Fi SSID across
@@ -439,16 +584,31 @@ class NetworkSettingsAudit:
         stats = psutil.net_if_stats()
         addresses = self._interface_addresses()
         macs = self._mac_addresses()
-        gateways = self._default_gateways()
-        dns_by_adapter = self._dns_servers_by_adapter()
+
+        ps_data = (
+            self._windows_network_ps_data()
+            if self.system == "Windows"
+            else None
+        )
+
+        gateways = self._default_gateways(
+            ps_routes=ps_data.get("routes") if ps_data else None
+        )
+        dns_by_adapter = self._dns_servers_by_adapter(
+            ps_dns=ps_data.get("dns") if ps_data else None
+        )
         dns_servers = (
             [] if dns_by_adapter is not None else self._dns_servers()
         )
-        dhcp_by_adapter = self._dhcp_servers_by_adapter()
+        dhcp_by_adapter = self._dhcp_servers_by_adapter(
+            ps_dhcp=ps_data.get("dhcp") if ps_data else None
+        )
         dhcp_servers = (
             {} if dhcp_by_adapter is not None else self._dhcp_servers()
         )
-        wifi = self._wifi_info()
+        wifi = self._wifi_info(
+            ps_wifi=ps_data.get("wifi") if ps_data else None
+        )
 
         adapters = []
 

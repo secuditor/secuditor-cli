@@ -3,13 +3,19 @@
 """Cross-platform system settings and hardware inventory."""
 
 import json
+import os
 import platform
 import shutil
 import socket
 
 import psutil
 
-from ._utils import find_powershell, run_command, run_powershell
+from ._utils import (
+    find_powershell,
+    read_registry_value,
+    run_command,
+    run_powershell,
+)
 
 __all__ = ["SystemSettings", "SystemSettingsAudit"]
 
@@ -24,8 +30,89 @@ class SystemSettingsAudit:
         """Run a command without a shell; return stdout or None."""
         return run_command(args, timeout=self.timeout)
 
+    def _windows_os_name(self):
+        key_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        product = read_registry_value("HKLM", key_path, "ProductName")
+        edition_id = read_registry_value("HKLM", key_path, "EditionID")
+        display_ver = read_registry_value("HKLM", key_path, "DisplayVersion")
+        build_raw = (
+            read_registry_value("HKLM", key_path, "CurrentBuildNumber")
+            or read_registry_value("HKLM", key_path, "CurrentBuild")
+        )
+        if not product or not build_raw:
+            return None
+        try:
+            build = int(build_raw)
+        except (TypeError, ValueError):
+            return None
+
+        if "server" in str(product).casefold():
+            base = str(product)
+        elif build >= 22000:
+            editions = {
+                "Core": "Home",
+                "CoreN": "Home N",
+                "CoreSingleLanguage": "Home Single Language",
+                "Professional": "Pro",
+                "ProfessionalN": "Pro N",
+                "ProfessionalWorkstation": "Pro for Workstations",
+                "Enterprise": "Enterprise",
+                "EnterpriseN": "Enterprise N",
+                "Education": "Education",
+                "EducationN": "Education N",
+            }
+            ed = editions.get(edition_id, edition_id) if edition_id else ""
+            base = f"Windows 11 {ed}".strip()
+        else:
+            base = str(product)
+
+        return f"{base} ({display_ver})" if display_ver else base
+
+    def _linux_os_name(self):
+        try:
+            with open("/etc/os-release", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("PRETTY_NAME="):
+                        return line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+        return None
+
+    def _macos_os_name(self):
+        name = self._run(["sw_vers", "-productName"])
+        ver = self._run(["sw_vers", "-productVersion"])
+        if name and ver:
+            return f"{name} {ver}"
+        return None
+
+    def _firmware_type(self):
+        if self.system == "Windows":
+            try:
+                import ctypes
+
+                firmware_type = ctypes.c_int()
+                fn = ctypes.windll.kernel32.GetFirmwareType
+                fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
+                fn.restype = ctypes.c_bool
+                if fn(ctypes.byref(firmware_type)):
+                    return {1: "BIOS", 2: "UEFI"}.get(
+                        firmware_type.value, "Unknown"
+                    )
+            except (ImportError, AttributeError, OSError):
+                pass
+            return "Unknown"
+        if self.system == "Linux":
+            return "UEFI" if os.path.isdir("/sys/firmware/efi") else "BIOS"
+        if self.system == "Darwin":
+            return "UEFI/Apple Silicon" if platform.machine() == "arm64" else "UEFI"
+        return "Unknown"
+
     def get_system_settings(self):
         memory = psutil.virtual_memory()
+        try:
+            cpu_freq = psutil.cpu_freq()
+        except Exception:
+            cpu_freq = None
 
         resources = {
             "Machine": platform.machine() or None,
@@ -33,6 +120,11 @@ class SystemSettingsAudit:
             "Architecture": platform.architecture()[0],
             "Physical CPU Cores": psutil.cpu_count(logical=False),
             "Logical CPU Threads": psutil.cpu_count(logical=True),
+            "CPU Frequency (MHz)": (
+                round(cpu_freq.current)
+                if cpu_freq and cpu_freq.current
+                else None
+            ),
             "RAM (GB)": round(memory.total / (1024 ** 3), 2),
         }
 
@@ -53,12 +145,21 @@ class SystemSettingsAudit:
                 "Usage (%)": usage.percent,
             }
 
+        os_name = None
+        if self.system == "Windows":
+            os_name = self._windows_os_name()
+        elif self.system == "Linux":
+            os_name = self._linux_os_name()
+        elif self.system == "Darwin":
+            os_name = self._macos_os_name()
+
         return {
             "hostname": socket.gethostname(),
             "platform": self.system,
-            "OS": platform.platform(),
+            "OS": os_name or platform.platform(),
             "OS Release": platform.release(),
             "OS Version": platform.version(),
+            "Firmware": self._firmware_type(),
             "Resources": resources,
             "Disks": disks,
         }
@@ -161,7 +262,7 @@ class SystemSettingsAudit:
 
             categories[category] = {
                 "status": "available",
-                "devices": devices,
+                "devices": list(dict.fromkeys(devices)),
             }
 
         return categories

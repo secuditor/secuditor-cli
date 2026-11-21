@@ -15,7 +15,7 @@ Run a specific audit module using its flag (add `--json` for JSON output):
 ```bash
 secuditor -dsa          # Domain affiliation, users, LAPS, NTLM, and NTP
 secuditor -app          # Installed applications inventory
-secuditor -pas          # Local password policy settings
+secuditor -pwd          # Local password policy settings
 secuditor -sys          # System specifications and connected hardware
 secuditor -net          # Network adapters, IPs, gateways, DNS, DHCP, and Wi-Fi
 ```
