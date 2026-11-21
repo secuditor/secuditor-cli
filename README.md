@@ -1,6 +1,6 @@
 # Secuditor CLI
 
-A cross-platform Python library and CLI for security diagnostics, configuration auditing, and system inventory across Windows, Linux, and macOS, inspired by Secuditor Lite.
+An open-source, cross-platform Python library and CLI for security diagnostics, configuration auditing, and system inventory across Windows, Linux, and macOS, inspired by Secuditor Lite.
 
 ## Installation
 
