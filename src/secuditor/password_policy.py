@@ -10,12 +10,13 @@ import re
 import shutil
 import tempfile
 
-from ._utils import run_command
+from ._utils import read_registry_value, run_command, run_powershell
 
 __all__ = ["PasswordPolicy", "PasswordPolicyAudit"]
 
 _TIMEQ_FOREVER = 0xFFFFFFFF
 _UF_PASSWD_NOTREQD = 0x0020
+_UF_DONT_EXPIRE_PASSWD = 0x10000
 
 
 class PasswordPolicyAudit:
@@ -46,7 +47,9 @@ class PasswordPolicyAudit:
             "lockout_duration_minutes",
             "lockout_reset_minutes",
             "account_expiration",
+            "password_expires",
             "password_required",
+            "pin_or_biometrics",
         ]
 
         return {
@@ -198,6 +201,7 @@ class PasswordPolicyAudit:
                 )
 
         populated = False
+        max_passwd_age = None
         if not (is_domain_joined and not target_server):
             modals0_buf = ctypes.c_void_p()
             try:
@@ -207,11 +211,12 @@ class PasswordPolicyAudit:
                     info0 = ctypes.cast(
                         modals0_buf, ctypes.POINTER(USER_MODALS_INFO_0)
                     ).contents
+                    max_passwd_age = int(info0.usrmod0_max_passwd_age)
                     report["settings"]["minimum_length"] = self._setting(
                         int(info0.usrmod0_min_passwd_len), "detected"
                     )
                     report["settings"]["maximum_age_days"] = self._setting(
-                        self._seconds_to_days(info0.usrmod0_max_passwd_age),
+                        self._seconds_to_days(max_passwd_age),
                         "detected",
                     )
                     report["settings"]["minimum_age_days"] = self._setting(
@@ -235,24 +240,28 @@ class PasswordPolicyAudit:
                     info3 = ctypes.cast(
                         modals3_buf, ctypes.POINTER(USER_MODALS_INFO_3)
                     ).contents
+                    threshold = int(info3.usrmod3_lockout_threshold)
+                    duration = int(info3.usrmod3_lockout_duration)
+                    obs_window = int(info3.usrmod3_lockout_observation_window)
+
                     report["settings"]["lockout_threshold"] = self._setting(
-                        int(info3.usrmod3_lockout_threshold), "detected"
+                        threshold, "detected"
                     )
+                    if threshold == 0:
+                        dur_val = "not_applicable"
+                        reset_val = "not_applicable"
+                    else:
+                        if duration in (0, _TIMEQ_FOREVER):
+                            dur_val = "until_admin_unlocks"
+                        else:
+                            dur_val = self._seconds_to_minutes(duration)
+                        reset_val = self._seconds_to_minutes(obs_window)
+
                     report["settings"]["lockout_duration_minutes"] = (
-                        self._setting(
-                            self._seconds_to_minutes(
-                                info3.usrmod3_lockout_duration
-                            ),
-                            "detected",
-                        )
+                        self._setting(dur_val, "detected")
                     )
                     report["settings"]["lockout_reset_minutes"] = (
-                        self._setting(
-                            self._seconds_to_minutes(
-                                info3.usrmod3_lockout_observation_window
-                            ),
-                            "detected",
-                        )
+                        self._setting(reset_val, "detected")
                     )
                     populated = True
             finally:
@@ -308,6 +317,20 @@ class PasswordPolicyAudit:
                         report["settings"]["password_required"] = self._setting(
                             not bool(flags & _UF_PASSWD_NOTREQD), "detected"
                         )
+                        acct_never_expires = bool(
+                            flags & _UF_DONT_EXPIRE_PASSWD
+                        )
+                        if acct_never_expires or max_passwd_age in (
+                            0,
+                            _TIMEQ_FOREVER,
+                        ):
+                            report["settings"]["password_expires"] = (
+                                self._setting(False, "detected")
+                            )
+                        elif max_passwd_age is not None and max_passwd_age > 0:
+                            report["settings"]["password_expires"] = (
+                                self._setting(True, "detected")
+                            )
                         acct_exp = int(info2.usri2_acct_expires)
                         if acct_exp == _TIMEQ_FOREVER:
                             exp_val = "never"
@@ -325,6 +348,191 @@ class PasswordPolicyAudit:
             pass
 
         return populated
+
+    @staticmethod
+    def _windows_is_admin():
+        """Return True if the current process is elevated on Windows."""
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (ImportError, AttributeError, OSError):
+            return False
+
+    @staticmethod
+    def _windows_current_user_sid():
+        """Return the current process user SID string via Win32 token APIs."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            TOKEN_QUERY = 0x0008
+            TokenUser = 1
+
+            class SID_AND_ATTRIBUTES(ctypes.Structure):
+                _fields_ = [
+                    ("Sid", ctypes.c_void_p),
+                    ("Attributes", wintypes.DWORD),
+                ]
+
+            class TOKEN_USER(ctypes.Structure):
+                _fields_ = [("User", SID_AND_ATTRIBUTES)]
+
+            kernel32 = ctypes.windll.kernel32
+            advapi32 = ctypes.windll.advapi32
+
+            GetCurrentProcess = kernel32.GetCurrentProcess
+            GetCurrentProcess.restype = wintypes.HANDLE
+
+            CloseHandle = kernel32.CloseHandle
+            CloseHandle.argtypes = [wintypes.HANDLE]
+            CloseHandle.restype = wintypes.BOOL
+
+            LocalFree = kernel32.LocalFree
+            LocalFree.argtypes = [ctypes.c_void_p]
+            LocalFree.restype = ctypes.c_void_p
+
+            OpenProcessToken = advapi32.OpenProcessToken
+            OpenProcessToken.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.HANDLE),
+            ]
+            OpenProcessToken.restype = wintypes.BOOL
+
+            GetTokenInformation = advapi32.GetTokenInformation
+            GetTokenInformation.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            GetTokenInformation.restype = wintypes.BOOL
+
+            ConvertSidToStringSidW = advapi32.ConvertSidToStringSidW
+            ConvertSidToStringSidW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            ConvertSidToStringSidW.restype = wintypes.BOOL
+
+            tok = wintypes.HANDLE()
+            if not OpenProcessToken(
+                GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(tok)
+            ):
+                return None
+
+            try:
+                buf_len = wintypes.DWORD(0)
+                GetTokenInformation(
+                    tok, TokenUser, None, 0, ctypes.byref(buf_len)
+                )
+                if buf_len.value == 0:
+                    return None
+                buf = ctypes.create_string_buffer(buf_len.value)
+                if not GetTokenInformation(
+                    tok,
+                    TokenUser,
+                    buf,
+                    buf_len.value,
+                    ctypes.byref(buf_len),
+                ):
+                    return None
+                token_user = ctypes.cast(buf, ctypes.POINTER(TOKEN_USER)).contents
+                sid_str_ptr = ctypes.c_void_p()
+                try:
+                    if (
+                        ConvertSidToStringSidW(
+                            token_user.User.Sid, ctypes.byref(sid_str_ptr)
+                        )
+                        and sid_str_ptr.value
+                    ):
+                        return ctypes.wstring_at(sid_str_ptr.value)
+                finally:
+                    if sid_str_ptr.value:
+                        LocalFree(sid_str_ptr)
+            finally:
+                CloseHandle(tok)
+        except (ImportError, AttributeError, OSError):
+            pass
+        return None
+
+    def _windows_hello_pin(self):
+        """Check Windows Hello (PIN / Biometrics) for the current user without admin rights."""
+        user_sid = self._windows_current_user_sid()
+        if not user_sid:
+            return None
+
+        factors = []
+
+        # Windows Hello PIN (NGC Credential Provider / LogonUI NgcPin)
+        pin_active = False
+        ngc_path = (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication"
+            rf"\Credential Providers\{{D6886603-9D2F-4EB2-B667-1971041FA96B}}\{user_sid}"
+        )
+        logon_creds = read_registry_value("HKLM", ngc_path, "LogonCredsAvailable")
+        try:
+            if logon_creds is not None and int(logon_creds) == 1:
+                pin_active = True
+        except (TypeError, ValueError):
+            pass
+
+        if not pin_active:
+            pin_cred_path = (
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication"
+                rf"\LogonUI\NgcPin\Credentials\{user_sid}"
+            )
+            enc_pwd = read_registry_value(
+                "HKLM", pin_cred_path, "EncryptedPassword"
+            )
+            if enc_pwd:
+                pin_active = True
+
+        if pin_active:
+            factors.append("PIN")
+
+        # Windows Hello Biometrics (WinBio EnrolledFactors bitmask)
+        bio_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\WinBio\AccountInfo\{user_sid}"
+        raw_mask = read_registry_value("HKLM", bio_path, "EnrolledFactors")
+        try:
+            mask = int(raw_mask) if raw_mask is not None else 0
+            if mask > 0:
+                bio_found = False
+                if mask & 0x02:
+                    factors.append("Face")
+                    bio_found = True
+                if mask & 0x08:
+                    factors.append("Fingerprint")
+                    bio_found = True
+                if mask & 0x10:
+                    factors.append("Iris")
+                    bio_found = True
+                if not bio_found:
+                    factors.append("Biometrics")
+        except (TypeError, ValueError):
+            pass
+
+        if factors:
+            return f"Enabled ({', '.join(factors)})"
+        return "Not Configured"
+
+    def _windows_domain_complexity(self):
+        """Query Active Directory default domain password complexity without admin rights."""
+        ps_cmd = (
+            "try { "
+            "$nc = ([ADSI]'LDAP://RootDSE').defaultNamingContext; "
+            "if ($nc) { ([ADSI]('LDAP://' + $nc)).pwdProperties.Value } "
+            "} catch {}"
+        )
+        out = run_powershell(ps_cmd, timeout=self.timeout, parse_json=False)
+        if not out:
+            return None
+        try:
+            return bool(int(out.strip()) & 0x00000001)
+        except ValueError:
+            return None
 
     def _audit_windows(self, report):
         # Prefer locale-independent Win32 NetAPI, falling back to `net accounts`.
@@ -377,53 +585,75 @@ class PasswordPolicyAudit:
 
                     report["settings"][key] = self._setting(value, "detected")
 
-        # Export security policy into an isolated temporary directory to inspect
-        # PasswordComplexity. This typically requires elevated privileges.
-        policy_text = None
-        try:
-            with tempfile.TemporaryDirectory(prefix="secuditor_policy_") as tmpdir:
-                temp_path = os.path.join(tmpdir, "policy.inf")
-                output = self._run([
-                    "secedit.exe",
-                    "/export",
-                    "/cfg",
-                    temp_path,
-                    "/areas",
-                    "SECURITYPOLICY",
-                ])
-
-                if output is not None and os.path.isfile(temp_path):
-                    for encoding in ("utf-16", "utf-8-sig"):
-                        try:
-                            with open(temp_path, encoding=encoding) as file:
-                                policy_text = file.read()
-                            break
-                        except (UnicodeError, OSError):
-                            continue
-        except OSError:
-            pass
-
-        if policy_text:
-            match = re.search(
-                r"^\s*PasswordComplexity\s*=\s*(\d+)",
-                policy_text,
-                re.MULTILINE | re.IGNORECASE,
+        # Non-admin Windows Hello / PIN & Biometrics detection.
+        hello_status = self._windows_hello_pin()
+        if hello_status is not None:
+            report["settings"]["pin_or_biometrics"] = self._setting(
+                hello_status, "detected"
             )
-            if match:
-                enabled = match.group(1) == "1"
+
+        # Password complexity: prefer non-admin AD LDAP on domain-joined hosts,
+        # otherwise use secedit when elevated.
+        complexity_resolved = False
+        if report.get("scope") == "domain":
+            dom_comp = self._windows_domain_complexity()
+            if dom_comp is not None:
                 report["settings"]["complexity"] = self._setting(
-                    enabled, "detected"
+                    dom_comp, "detected"
                 )
+                complexity_resolved = True
+
+        if not complexity_resolved:
+            policy_text = None
+            if self._windows_is_admin():
+                try:
+                    with tempfile.TemporaryDirectory(
+                        prefix="secuditor_policy_"
+                    ) as tmpdir:
+                        temp_path = os.path.join(tmpdir, "policy.inf")
+                        output = self._run([
+                            "secedit.exe",
+                            "/export",
+                            "/cfg",
+                            temp_path,
+                            "/areas",
+                            "SECURITYPOLICY",
+                        ])
+
+                        if output is not None and os.path.isfile(temp_path):
+                            for encoding in ("utf-16", "utf-8-sig"):
+                                try:
+                                    with open(
+                                        temp_path, encoding=encoding
+                                    ) as file:
+                                        policy_text = file.read()
+                                    break
+                                except (UnicodeError, OSError):
+                                    continue
+                except OSError:
+                    pass
+
+            if policy_text:
+                match = re.search(
+                    r"^\s*PasswordComplexity\s*=\s*(\d+)",
+                    policy_text,
+                    re.MULTILINE | re.IGNORECASE,
+                )
+                if match:
+                    enabled = match.group(1) == "1"
+                    report["settings"]["complexity"] = self._setting(
+                        enabled, "detected"
+                    )
+                else:
+                    report["limitations"].append(
+                        "Password complexity was not present in the "
+                        "exported security policy."
+                    )
             else:
                 report["limitations"].append(
-                    "Password complexity was not present in the "
-                    "exported security policy."
+                    "Password complexity could not be retrieved; "
+                    "secedit may require elevated privileges."
                 )
-        else:
-            report["limitations"].append(
-                "Password complexity could not be retrieved; "
-                "secedit may require elevated privileges."
-            )
 
         report["limitations"].append(
             "Results may reflect local or domain-applied account policy; "
@@ -476,6 +706,7 @@ class PasswordPolicyAudit:
         found_pam = False
         complexity_options = []
         faillock_options = {}
+        bio_modules = []
 
         for path in pam_files:
             try:
@@ -506,6 +737,20 @@ class PasswordPolicyAudit:
                         m = re.search(rf"\b{opt}\s*=\s*(\d+)", line)
                         if m:
                             faillock_options[opt] = int(m.group(1))
+
+                if re.search(r"\bpam_fprintd\.so\b", line) and "Fingerprint" not in bio_modules:
+                    bio_modules.append("Fingerprint")
+                if re.search(r"\bpam_u2f\.so\b", line) and "U2F/FIDO2" not in bio_modules:
+                    bio_modules.append("U2F/FIDO2")
+
+        if bio_modules:
+            report["settings"]["pin_or_biometrics"] = self._setting(
+                f"Enabled ({', '.join(bio_modules)})", "detected"
+            )
+        elif found_pam:
+            report["settings"]["pin_or_biometrics"] = self._setting(
+                "Not Configured", "detected"
+            )
 
         # Read /etc/security/pwquality.conf for minlen and credit settings.
         pwquality_cfg = {}
@@ -601,18 +846,21 @@ class PasswordPolicyAudit:
                     if ":" not in line:
                         continue
                     label, val = line.split(":", 1)
-                    if label.strip().lower() == "account expires":
-                        cleaned = val.strip()
-                        if cleaned:
-                            report["settings"]["account_expiration"] = (
-                                self._setting(
-                                    "never"
-                                    if cleaned.lower() == "never"
-                                    else cleaned,
-                                    "detected",
-                                )
+                    norm_label = label.strip().lower()
+                    cleaned = val.strip()
+                    if norm_label == "account expires" and cleaned:
+                        report["settings"]["account_expiration"] = (
+                            self._setting(
+                                "never"
+                                if cleaned.lower() == "never"
+                                else cleaned,
+                                "detected",
                             )
-                        break
+                        )
+                    elif norm_label == "password expires" and cleaned:
+                        report["settings"]["password_expires"] = self._setting(
+                            cleaned.lower() != "never", "detected"
+                        )
             else:
                 report["limitations"].append(
                     "Unable to retrieve current-user aging information."
@@ -688,6 +936,21 @@ class PasswordPolicyAudit:
                     report["settings"][key] = self._setting(value, "detected")
         elif "global_policy" not in report:
             report["global_policy"] = self._setting(None, "unavailable")
+
+        # Check Touch ID status via bioutil when available on macOS.
+        if shutil.which("bioutil"):
+            bio_out = self._run(["bioutil", "-r"])
+            if bio_out:
+                m = re.search(
+                    r"Touch ID for unlock:\s*(\d+)", bio_out, re.IGNORECASE
+                )
+                if m:
+                    report["settings"]["pin_or_biometrics"] = self._setting(
+                        "Enabled (Touch ID)"
+                        if m.group(1) == "1"
+                        else "Not Configured",
+                        "detected",
+                    )
 
         report["limitations"].append(
             "macOS password policy retrieval depends on account type, "

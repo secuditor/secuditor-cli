@@ -2,6 +2,7 @@
 
 """Cross-platform SSL/TLS interception and certificate trust inspection."""
 
+import hashlib
 import json
 import re
 import socket
@@ -84,7 +85,6 @@ PUBLIC_CAS = (
     "Apple",
     "Amazon",
     "Internet Security Research Group",
-    "Cloudflare",
     "Starfield",
     "Comodo",
     "Izenpe",
@@ -181,21 +181,54 @@ class SSLInterceptionAudit:
                     return tok
         return None
 
-    def _fetch_peer_cert(self, host: str, port: int, context: ssl.SSLContext):
-        """Connect, perform TLS handshake, and return (DER bytes, negotiated TLS version)."""
-        with socket.create_connection((host, port), timeout=self.timeout) as sock:
+    def _fetch_peer_cert(
+        self,
+        host: str,
+        port: int,
+        context: ssl.SSLContext,
+        connect_host: str | None = None,
+    ):
+        """Connect, perform TLS handshake, and return (DER bytes, TLS version, peer IP)."""
+        target = connect_host or host
+        with socket.create_connection((target, port), timeout=self.timeout) as sock:
+            peer_ip = sock.getpeername()[0]
             with context.wrap_socket(sock, server_hostname=host) as ssock:
-                return ssock.getpeercert(binary_form=True), ssock.version()
+                return ssock.getpeercert(binary_form=True), ssock.version(), peer_ip
 
-    def _verify_public_chain(self, host: str, port: int) -> bool | None:
-        """Verify certificate chain against public WebPKI roots (certifi)."""
+    @staticmethod
+    def _unpack_fetch_result(result):
+        """Support both (der, tls_version, peer_ip) and legacy 2-tuple mocks."""
+        if len(result) == 3:
+            return result[0], result[1], result[2]
+        return result[0], result[1], None
+
+    def _verify_public_chain(
+        self,
+        host: str,
+        port: int,
+        connect_host: str | None = None,
+        expected_fingerprint: str | None = None,
+    ) -> bool | None:
+        """Verify certificate chain against public WebPKI roots (certifi).
+
+        Pins Stage 2 to the Stage-1 peer IP and compares the leaf certificate
+        SHA-256 fingerprint to prevent CDN/anycast or race-condition mismatches.
+        """
         if certifi is None:
             return None
         try:
             public_ctx = ssl.create_default_context(cafile=certifi.where())
             public_ctx.check_hostname = True
             public_ctx.verify_mode = ssl.CERT_REQUIRED
-            self._fetch_peer_cert(host, port, public_ctx)
+            der, _tls_version, _peer_ip = self._unpack_fetch_result(
+                self._fetch_peer_cert(
+                    host, port, public_ctx, connect_host=connect_host
+                )
+            )
+            if expected_fingerprint and der:
+                stage2_fp = hashlib.sha256(der).hexdigest()
+                if stage2_fp != expected_fingerprint:
+                    return None
             return True
         except ssl.SSLCertVerificationError:
             return False
@@ -220,9 +253,10 @@ class SSLInterceptionAudit:
 
             os_trusted = True
             verify_error = None
+            peer_ip = None
             try:
-                der, tls_version = self._fetch_peer_cert(
-                    target_host, target_port, os_ctx
+                der, tls_version, peer_ip = self._unpack_fetch_result(
+                    self._fetch_peer_cert(target_host, target_port, os_ctx)
                 )
             except ssl.SSLCertVerificationError as verify_exc:
                 os_trusted = False
@@ -234,13 +268,20 @@ class SSLInterceptionAudit:
                 raw_ctx = ssl.create_default_context()
                 raw_ctx.check_hostname = False
                 raw_ctx.verify_mode = ssl.CERT_NONE
-                der, tls_version = self._fetch_peer_cert(
-                    target_host, target_port, raw_ctx
+                der, tls_version, peer_ip = self._unpack_fetch_result(
+                    self._fetch_peer_cert(target_host, target_port, raw_ctx)
                 )
 
-            # Stage 2: Check whether an OS-trusted cert also chains to a public WebPKI root.
+            fingerprint_stage1 = hashlib.sha256(der).hexdigest() if der else None
+
+            # Stage 2: Check whether the same OS-trusted cert also chains to a public WebPKI root.
             public_trusted = (
-                self._verify_public_chain(target_host, target_port)
+                self._verify_public_chain(
+                    target_host,
+                    target_port,
+                    connect_host=peer_ip,
+                    expected_fingerprint=fingerprint_stage1,
+                )
                 if os_trusted
                 else False
             )
@@ -317,15 +358,13 @@ class SSLInterceptionAudit:
 
             # Detection & classification.
             issuer_fields = self._extract_issuer_fields(cert)
-            matched_public_ca = self._matches_issuer_list(
-                issuer_fields, PUBLIC_CAS
-            )
             matched_legit_vendor = self._matches_issuer_list(
                 issuer_fields, LEGIT_ISSUERS
             )
 
             triggers = []
             trust_mismatch = False
+            public_check_inconclusive = False
 
             if not os_trusted:
                 trust_mismatch = True
@@ -337,9 +376,8 @@ class SSLInterceptionAudit:
             elif public_trusted is False:
                 trust_mismatch = True
                 triggers.append("Non-public root CA")
-            elif public_trusted is None and not matched_public_ca:
-                trust_mismatch = True
-                triggers.append("Unknown issuer")
+            elif public_trusted is None:
+                public_check_inconclusive = True
 
             validity_days = (not_after - not_before).days
             unusual_lifetime = validity_days <= 0 or validity_days > 825
@@ -374,11 +412,16 @@ class SSLInterceptionAudit:
                 ):
                     verdict = "Suspicious"
                     reason = ", ".join(triggers)
-                elif matched_legit_vendor:
+                elif (
+                    os_trusted
+                    and public_trusted is False
+                    and matched_legit_vendor
+                ):
                     legit = True
                     verdict = "Likely Legitimate"
                     reason = (
-                        f"Issued by {matched_legit_vendor} (firewall inspection)"
+                        f"OS-trusted non-public CA matching "
+                        f"{matched_legit_vendor} (name match)"
                     )
                 else:
                     verdict = "Suspicious"
@@ -386,6 +429,9 @@ class SSLInterceptionAudit:
             elif triggers:
                 verdict = "Suspicious"
                 reason = ", ".join(triggers)
+            elif public_check_inconclusive:
+                verdict = "Unknown"
+                reason = "Public CA verification unavailable"
             else:
                 verdict = "Not Detected"
 

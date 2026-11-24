@@ -18,8 +18,10 @@ from secuditor import (
     InstalledApps,
     NetworkSettings,
     PasswordPolicy,
+    RemoteAccessSettings,
     SSLInterception,
     SecurityAudit,
+    SuspiciousProxy,
     SystemSettings,
 )
 from secuditor._utils import _sanitize_path_env, _system_exe
@@ -58,6 +60,7 @@ class TestDomainAudit(unittest.TestCase):
 
         with (
             patch.object(audit, "_windows_join_info", return_value=(None, None)),
+            patch.object(audit, "_windows_users_netapi", return_value=False),
             patch.object(audit, "_powershell", side_effect=ps_responses),
             patch.object(audit, "_run", side_effect=run_responses),
             patch.object(audit, "_windows_registry_value", return_value=None),
@@ -100,10 +103,14 @@ class TestDomainAudit(unittest.TestCase):
             }
         ]
 
-        with patch.object(
-            audit,
-            "_powershell",
-            side_effect=[users_payload, admins_payload],
+        with (
+            patch.object(audit, "_is_windows_domain_controller", return_value=False),
+            patch.object(audit, "_windows_users_netapi", return_value=False),
+            patch.object(
+                audit,
+                "_powershell",
+                side_effect=[users_payload, admins_payload],
+            ),
         ):
             audit._windows_users(report)
 
@@ -180,6 +187,42 @@ class TestDomainAudit(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 3)
         self.assertEqual(report["users"]["privileged"][0]["name"], "Administrator")
         self.assertEqual(report["users"]["regular"][0]["name"], "Guest")
+
+    def test_windows_users_skipped_on_domain_controller(self):
+        audit = DomainAudit()
+        audit.system = "Windows"
+        report = audit._base_report()
+
+        with (
+            patch.object(audit, "_is_windows_domain_controller", return_value=True),
+            patch.object(audit, "_windows_users_netapi") as mock_netapi,
+            patch.object(audit, "_powershell") as mock_ps,
+        ):
+            audit._windows_users(report)
+
+        self.assertEqual(report["users"]["status"], "not_applicable")
+        mock_netapi.assert_not_called()
+        mock_ps.assert_not_called()
+
+    def test_ntlm_verdict_hardened_rules(self):
+        # NoLMHash == 0 always flagged first
+        self.assertIn(
+            "Warning",
+            DomainAudit._ntlm_verdict(5, 0, 2, restrict_sending=2, restrict_receiving=2),
+        )
+        # Blocking requires BOTH sending and receiving == 2
+        self.assertIn(
+            "Critical",
+            DomainAudit._ntlm_verdict(2, 1, None, restrict_sending=2, restrict_receiving=0),
+        )
+        self.assertIn(
+            "Strong",
+            DomainAudit._ntlm_verdict(2, 1, 2, restrict_sending=2, restrict_receiving=2),
+        )
+        # Level 2 is Weak, Level 4 is Moderate, Level 5 is Strong
+        self.assertIn("Critical", DomainAudit._ntlm_verdict(2, 1, None))
+        self.assertIn("Moderate", DomainAudit._ntlm_verdict(4, 1, None))
+        self.assertIn("Strong", DomainAudit._ntlm_verdict(5, 1, 2))
 
 
 class TestInstalledAppsAudit(unittest.TestCase):
@@ -345,6 +388,8 @@ class TestPasswordPolicyAudit(unittest.TestCase):
 
         with (
             patch.object(audit, "_windows_netapi_policy", return_value=False),
+            patch.object(audit, "_windows_hello_pin", return_value="Enabled (PIN, Fingerprint)"),
+            patch.object(audit, "_windows_is_admin", return_value=False),
             patch.object(audit, "_run", side_effect=[sample_output, None]),
         ):
             audit._audit_windows(report)
@@ -352,8 +397,47 @@ class TestPasswordPolicyAudit(unittest.TestCase):
         self.assertEqual(report["settings"]["minimum_length"]["value"], 12)
         self.assertEqual(report["settings"]["password_history"]["value"], "none")
         self.assertEqual(report["settings"]["lockout_threshold"]["value"], 5)
+        self.assertEqual(
+            report["settings"]["pin_or_biometrics"]["value"],
+            "Enabled (PIN, Fingerprint)",
+        )
         for setting in report["settings"].values():
             self.assertNotIn("source", setting)
+
+    def test_windows_hello_pin_and_domain_complexity_helpers(self):
+        audit = PasswordPolicy()
+        audit.system = "Windows"
+        sid = "S-1-5-21-100-1001"
+        reg_values = {
+            (
+                "HKLM",
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication"
+                rf"\Credential Providers\{{D6886603-9D2F-4EB2-B667-1971041FA96B}}\{sid}",
+                "LogonCredsAvailable",
+            ): 1,
+            (
+                "HKLM",
+                rf"SOFTWARE\Microsoft\Windows\CurrentVersion\WinBio\AccountInfo\{sid}",
+                "EnrolledFactors",
+            ): 0x0A,  # Face (0x02) + Fingerprint (0x08)
+        }
+        with (
+            patch.object(audit, "_windows_current_user_sid", return_value=sid),
+            patch(
+                "secuditor.password_policy.read_registry_value",
+                side_effect=lambda r, p, n: reg_values.get((r, p, n)),
+            ),
+        ):
+            self.assertEqual(
+                audit._windows_hello_pin(),
+                "Enabled (PIN, Face, Fingerprint)",
+            )
+
+        with patch(
+            "secuditor.password_policy.run_powershell",
+            return_value="1",
+        ):
+            self.assertIs(audit._windows_domain_complexity(), True)
 
     def test_linux_faillock_and_chage_parsing(self):
         audit = PasswordPolicy()
@@ -439,6 +523,31 @@ class TestSystemSettingsAudit(unittest.TestCase):
         ):
             self.assertEqual(audit._windows_os_name(), "Windows 11 Pro (24H2)")
 
+    def test_parse_windows_hardware_cim_filters_virtual_gpus_and_maps_memory(self):
+        payload = {
+            "bios": "F.24",
+            "memory": [
+                {"ConfiguredClockSpeed": 4800, "SMBIOSMemoryType": 34},
+                {"ConfiguredClockSpeed": 4800, "SMBIOSMemoryType": 34},
+            ],
+            "gpus": [
+                {
+                    "AdapterCompatibility": "Microsoft",
+                    "Name": "Microsoft Basic Display Adapter",
+                },
+                {
+                    "AdapterCompatibility": "NVIDIA",
+                    "Name": "NVIDIA GeForce RTX 4070",
+                },
+            ],
+        }
+        parsed = SystemSettings._parse_windows_hardware_cim(payload)
+        self.assertEqual(parsed["firmware_version"], "F.24")
+        self.assertEqual(parsed["memory_type"], "DDR5")
+        self.assertEqual(parsed["memory_speed"], "4800 MHz")
+        self.assertEqual(parsed["gpu_manufacturer"], "NVIDIA")
+        self.assertEqual(parsed["gpu_model"], "NVIDIA GeForce RTX 4070")
+
 
 class TestSSLInterceptionAudit(unittest.TestCase):
     @staticmethod
@@ -473,8 +582,12 @@ class TestSSLInterceptionAudit(unittest.TestCase):
         audit = SSLInterception()
 
         with (
-            patch.object(audit, "_fetch_peer_cert", return_value=(der, "TLSv1.3")),
-            patch.object(audit, "_verify_public_chain", return_value=True),
+            patch.object(
+                audit,
+                "_fetch_peer_cert",
+                return_value=(der, "TLSv1.3", "142.250.1.1"),
+            ),
+            patch.object(audit, "_verify_public_chain", return_value=True) as mock_pub,
         ):
             result = audit.audit("www.google.com", 443)
 
@@ -483,13 +596,47 @@ class TestSSLInterceptionAudit(unittest.TestCase):
         self.assertEqual(result["key_type"], "ECC")
         self.assertEqual(result["key_bits"], 256)
         self.assertEqual(result["tls_version"], "TLSv1.3")
+        mock_pub.assert_called_once()
+        self.assertEqual(mock_pub.call_args.kwargs["connect_host"], "142.250.1.1")
+        self.assertEqual(
+            mock_pub.call_args.kwargs["expected_fingerprint"],
+            result["fingerprint_sha256"],
+        )
+
+    def test_stage2_fingerprint_mismatch_and_unavailable_public_ca_returns_unknown(self):
+        der_stage1 = self._build_test_der("Google Trust Services", "*.google.com")
+        der_stage2 = self._build_test_der("Google Trust Services", "*.google.com")
+        audit = SSLInterception()
+
+        with patch.object(
+            audit,
+            "_fetch_peer_cert",
+            side_effect=[
+                (der_stage1, "TLSv1.3", "142.250.1.1"),
+                (der_stage2, "TLSv1.3", "142.250.1.1"),
+            ],
+        ):
+            result = audit.audit("www.google.com", 443)
+
+        # Even though issuer matches a public CA name, Stage-1/Stage-2 mismatch
+        # must stay inconclusive (Unknown) rather than trusting name matching.
+        self.assertEqual(result["verdict"], "Unknown")
+        self.assertFalse(result["ssl_interception_detected"])
+        self.assertEqual(
+            result["interception_reason"],
+            "Public CA verification unavailable",
+        )
 
     def test_enterprise_firewall_issuer_classified_as_likely_legitimate(self):
         der = self._build_test_der("Zscaler", "www.google.com")
         audit = SSLInterception()
 
         with (
-            patch.object(audit, "_fetch_peer_cert", return_value=(der, "TLSv1.3")),
+            patch.object(
+                audit,
+                "_fetch_peer_cert",
+                return_value=(der, "TLSv1.3", "10.0.0.1"),
+            ),
             patch.object(audit, "_verify_public_chain", return_value=False),
         ):
             result = audit.audit("www.google.com", 443)
@@ -498,15 +645,16 @@ class TestSSLInterceptionAudit(unittest.TestCase):
         self.assertTrue(result["ssl_interception_detected"])
         self.assertTrue(result["interception_legit"])
         self.assertIn("Zscaler", result["interception_reason"])
+        self.assertIn("name match", result["interception_reason"])
 
     def test_untrusted_certificate_classified_as_suspicious(self):
         der = self._build_test_der("Unknown Corp", "www.google.com")
         audit = SSLInterception()
 
-        def fake_fetch(_host, _port, ctx):
+        def fake_fetch(_host, _port, ctx, connect_host=None):
             if ctx.verify_mode == ssl.CERT_REQUIRED:
                 raise ssl.SSLCertVerificationError("self-signed certificate")
-            return der, "TLSv1.3"
+            return der, "TLSv1.3", "10.0.0.2"
 
         with patch.object(audit, "_fetch_peer_cert", side_effect=fake_fetch):
             result = audit.audit("www.google.com", 443)
@@ -522,11 +670,16 @@ class TestEndpointSecurityAudit(unittest.TestCase):
         audit.system = "Windows"
 
         ps_bundle = {
-            "defender": {"AMServiceEnabled": True},
+            "defender": {
+                "AMServiceEnabled": True,
+                "AntivirusEnabled": True,
+                "RealTimeProtectionEnabled": True,
+            },
             "av": [
                 {"displayName": "Windows Defender", "productState": 397568},
                 {"displayName": "CrowdStrike Falcon", "productState": 266240},
             ],
+            "fw": [],
             "dep": 3,
             "dg_running": [1],
             "exec_policy": "RemoteSigned",
@@ -565,6 +718,45 @@ class TestEndpointSecurityAudit(unittest.TestCase):
         self.assertEqual(checks["UEFI Secure Boot"], "Enabled")
         self.assertEqual(checks["Removable Storage"], "Disabled")
         self.assertEqual(checks["USB AutoRun"], "Disabled")
+
+    def test_windows_defender_inactive_without_rtp_and_3p_firewall_via_sc2(self):
+        audit = SecurityAudit()
+        audit.system = "Windows"
+
+        ps_bundle = {
+            "defender": {
+                "AMServiceEnabled": True,
+                "AntivirusEnabled": True,
+                "RealTimeProtectionEnabled": False,
+            },
+            "av": [],
+            "fw": [
+                {"displayName": "ESET Firewall", "productState": 266240},
+            ],
+        }
+
+        with (
+            patch.object(audit, "_windows_ps_bundle", return_value=ps_bundle),
+            patch.object(audit, "_windows_auto_screen_lock", return_value="Default"),
+            patch.object(audit, "_windows_macro_policy", return_value=["Default"]),
+            patch.object(audit, "_windows_defender_asr", return_value="Not Configured"),
+            patch.object(audit, "_windows_uac", return_value="Default"),
+            patch.object(audit, "_windows_anonymous_access", return_value="Restricted"),
+            patch.object(audit, "_windows_efs_scan", return_value="No encrypted files"),
+            patch.object(audit, "_windows_system_restore", return_value="Enabled"),
+            patch("secuditor.endpoint_security.read_registry_value", return_value=None),
+        ):
+            report = audit.audit()
+
+        checks = report["checks"]
+        self.assertEqual(checks["Windows Defender"], ["Windows Defender (Inactive)"])
+        self.assertEqual(checks["Host-based Firewall"], "ESET Firewall (On)")
+
+    def test_windows_firewall_state_reports_off_when_mpssvc_stopped(self):
+        audit = SecurityAudit()
+        audit.system = "Windows"
+        with patch.object(audit, "_run", return_value="STATE              : 1  STOPPED"):
+            self.assertEqual(audit._windows_firewall_state(), "Off")
 
     def test_linux_audit_reports_mac_firewall_aslr_and_luks(self):
         audit = SecurityAudit()
@@ -606,6 +798,229 @@ class TestEndpointSecurityAudit(unittest.TestCase):
         self.assertEqual(checks["Disk Encryption"], "Enabled (LUKS/dm-crypt)")
         self.assertEqual(checks["UEFI Secure Boot"], "Unsupported")
         self.assertEqual(checks["System Snapshots"], "Available (Timeshift)")
+
+
+class TestSuspiciousProxyAudit(unittest.TestCase):
+    def test_windows_no_proxy_detected(self):
+        audit = SuspiciousProxy()
+        audit.system = "Windows"
+
+        with (
+            patch.object(
+                audit,
+                "_collect_wininet",
+                return_value={
+                    "manual": None,
+                    "raw_manual": "",
+                    "pac": None,
+                    "autodetect": False,
+                    "policy_enforced": False,
+                },
+            ),
+            patch.object(audit, "_collect_winhttp", return_value=("Direct Access", "")),
+            patch.object(audit, "_collect_env_proxies", return_value={}),
+            patch.object(audit, "_collect_portproxy_rules", return_value=[]),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["analysis"]["verdict"], "Not Detected")
+        self.assertFalse(report["analysis"]["proxy_detected"])
+        self.assertEqual(report["configuration"]["winhttp_proxy"], "Direct Access")
+
+    def test_windows_tunnel_listener_and_insecure_pac_flagged_suspicious(self):
+        audit = SuspiciousProxy()
+        audit.system = "Windows"
+
+        fake_listener = {
+            "pid": 4321,
+            "name": "chisel.exe",
+            "path": r"C:\Users\alice\Downloads\chisel.exe",
+            "signature": "NotSigned",
+            "signer": "",
+        }
+        with (
+            patch.object(
+                audit,
+                "_collect_wininet",
+                return_value={
+                    "manual": "socks=127.0.0.1:9050",
+                    "raw_manual": "socks=127.0.0.1:9050",
+                    "pac": "http://198.51.100.5/proxy.pac",
+                    "autodetect": False,
+                    "policy_enforced": False,
+                },
+            ),
+            patch.object(audit, "_collect_winhttp", return_value=("Direct Access", "")),
+            patch.object(audit, "_collect_env_proxies", return_value={}),
+            patch.object(audit, "_collect_portproxy_rules", return_value=["0.0.0.0:8080 -> 10.0.0.5:80"]),
+            patch.object(audit, "_find_listener_for_port", return_value=fake_listener),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["analysis"]["verdict"], "Suspicious")
+        self.assertTrue(report["analysis"]["proxy_detected"])
+        joined = " | ".join(report["analysis"]["triggers"])
+        self.assertIn("SOCKS/Tor", joined)
+        self.assertIn("Tunnel/MITM tool", joined)
+        self.assertIn("suspicious path", joined)
+        self.assertIn("Unencrypted HTTP PAC URL", joined)
+        self.assertIn("IP-literal PAC host", joined)
+        self.assertIn("Active netsh portproxy rule", joined)
+
+    def test_macos_scutil_proxy_parsing(self):
+        audit = SuspiciousProxy()
+        audit.system = "Darwin"
+
+        scutil_output = (
+            "<dictionary> {\n"
+            "  HTTPEnable : 1\n"
+            "  HTTPProxy : 93.184.216.34\n"
+            "  HTTPPort : 8080\n"
+            "  ProxyAutoDiscoveryEnable : 0\n"
+            "}\n"
+        )
+        with (
+            patch.object(audit, "_run", return_value=scutil_output),
+            patch.object(audit, "_collect_env_proxies", return_value={}),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["analysis"]["verdict"], "Suspicious")
+        self.assertIn("Public IP proxy target (93.184.216.34)", report["analysis"]["triggers"])
+        self.assertNotIn("winhttp_proxy", report["configuration"])
+
+
+class TestRemoteAccessAudit(unittest.TestCase):
+    def test_windows_audit_evaluates_rdp_smb_winrm_dcom_and_bluetooth(self):
+        audit = RemoteAccessSettings()
+        audit.system = "Windows"
+
+        ps_bundle = {
+            "fw_profiles": [True, True, True],
+            "winrm_listeners": {"ok": True, "keys": ["Transport=HTTP"]},
+            "smb2": {
+                "Service": {"Status": "Running", "StartType": "Automatic"},
+                "Config": {
+                    "EnableSMB2Protocol": True,
+                    "RequireSecuritySignature": True,
+                    "EncryptData": False,
+                    "RejectUnencryptedAccess": True,
+                    "EnableStrictNameChecking": True,
+                    "EnableAuthenticateUserSharing": False,
+                    "NullSessionShares": [],
+                },
+                "RestrictNullSessAccess": 1,
+            },
+            "rsync": None,
+            "upnp": {"State": "Stopped", "StartMode": "Manual"},
+            "bluetooth": {
+                "QuerySucceeded": True,
+                "Devices": [
+                    {
+                        "Status": "OK",
+                        "InstanceId": "USB\\VID_8087&PID_0029\\5&1",
+                        "Present": True,
+                        "ProblemCode": None,
+                        "DriverIsSigned": True,
+                    }
+                ],
+            },
+        }
+        reg_map = {
+            ("HKLM", r"SYSTEM\CurrentControlSet\Control\Terminal Server", "fDenyTSConnections"): 0,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp", "UserAuthentication"): 1,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp", "MinEncryptionLevel"): 3,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Control\Remote Assistance", "fAllowToGetHelp"): 0,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Control\Lsa\pku2u", "AllowOnlineID"): 0,
+            ("HKLM", r"SOFTWARE\Microsoft\Ole", "EnableDCOM"): "Y",
+            ("HKLM", r"SOFTWARE\Microsoft\Ole", "LegacyAuthenticationLevel"): 5,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters", "SMB1"): 0,
+            ("HKLM", r"SYSTEM\CurrentControlSet\Services\mrxsmb10", "Start"): 4,
+        }
+
+        def fake_run_raw(args):
+            svc = args[2] if len(args) > 2 else ""
+            if svc == "RemoteRegistry":
+                return "SERVICE_NAME: RemoteRegistry\nSTART_TYPE : 4 DISABLED"
+            if svc == "WinRM":
+                return "SERVICE_NAME: WinRM\nSTART_TYPE : 4 DISABLED"
+            if svc == "Spooler":
+                return "SERVICE_NAME: Spooler\nSTATE : 1 STOPPED"
+            return ""
+
+        with (
+            patch.object(audit, "_windows_ps_bundle", return_value=ps_bundle),
+            patch.object(audit, "_windows_is_admin", return_value=False),
+            patch.object(audit, "_windows_os_build", return_value=22631),
+            patch.object(audit, "_windows_winrm_ports", return_value=[]),
+            patch.object(audit, "_windows_ftp_service", return_value="Not Detected"),
+            patch.object(
+                audit,
+                "_query_bluetooth_win32_state",
+                return_value={
+                    "active_radios": 1,
+                    "connectable": True,
+                    "discoverable": False,
+                    "connected_count": 1,
+                    "paired_count": 1,
+                    "unauthenticated_connected": 0,
+                },
+            ),
+            patch.object(
+                audit,
+                "_query_bluetooth_exposure_extras",
+                return_value={
+                    "nearby_sharing_everyone": False,
+                    "pan_active": False,
+                    "file_transfer_active": False,
+                    "policy_hardened": True,
+                },
+            ),
+            patch.object(audit, "_run_raw", side_effect=fake_run_raw),
+            patch.object(audit, "_run", return_value="   NetBIOS over Tcpip. . . . . . . . : Disabled"),
+            patch("secuditor.remote_access.read_registry_value", side_effect=lambda r, p, n: reg_map.get((r, p, n))),
+        ):
+            report = audit.audit()
+
+        checks = report["checks"]
+        self.assertEqual(checks["Remote Desktop"], "Enabled, Low Risk (Default settings)")
+        self.assertEqual(checks["Remote Registry"], "Disabled")
+        self.assertEqual(checks["Remote Assistance"], "Disabled")
+        self.assertEqual(checks["WinRM"], "Disabled")
+        self.assertEqual(checks["PowerShell Remoting"], "Disabled")
+        self.assertEqual(checks["SMB1"], "Disabled")
+        self.assertEqual(checks["SMB2"], "Enabled, Low Risk (Signing/Encryption enforced)")
+        self.assertEqual(checks["PKU2U Authentication"], "Disabled")
+        self.assertEqual(checks["DCOM"], "Enabled, Low Risk (Secured authentication)")
+        self.assertEqual(checks["NetBIOS"], "Disabled")
+        self.assertEqual(checks["UPnPHost"], "Stopped")
+        self.assertIn("Enabled, Low Risk", checks["Bluetooth"])
+
+    def test_linux_audit_detects_ssh_root_login_cups_and_bluetooth(self):
+        audit = RemoteAccessSettings()
+        audit.system = "Linux"
+
+        with (
+            patch.object(
+                audit,
+                "_listening_ports_and_addrs",
+                return_value=({22: {"0.0.0.0"}, 631: {"127.0.0.1"}}, set()),
+            ),
+            patch("psutil.process_iter", return_value=[]),
+            patch.object(
+                audit,
+                "_parse_sshd_config",
+                return_value={"permitrootlogin": "yes"},
+            ),
+            patch("shutil.which", side_effect=lambda c: f"/usr/bin/{c}" if c == "bluetoothctl" else None),
+            patch.object(audit, "_run", return_value="Controller AA:BB\n\tPowered: yes\n\tDiscoverable: yes\n"),
+        ):
+            report = audit.audit()
+
+        checks = report["checks"]
+        self.assertIn("High Risk", checks["SSH Service"])
+        self.assertEqual(checks["Print Service (CUPS)"], "Enabled, Low Risk (Loopback only)")
+        self.assertEqual(checks["Bluetooth"], "Enabled, Exposure Detected (Discoverable)")
 
 
 if __name__ == "__main__":

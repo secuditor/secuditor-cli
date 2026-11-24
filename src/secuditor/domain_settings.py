@@ -325,9 +325,260 @@ class DomainSettingsAudit:
         report["users"]["status"] = "detected"
         return True
 
+    def _windows_users_netapi(self, report):
+        """Enumerate local users and Administrators via Win32 NetAPI (locale-independent)."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except ImportError:
+            return False
+
+        class LOCALGROUP_MEMBERS_INFO_2(ctypes.Structure):
+            _fields_ = [
+                ("lgrmi2_sid", ctypes.c_void_p),
+                ("lgrmi2_sidusage", wintypes.DWORD),
+                ("lgrmi2_domainandname", wintypes.LPWSTR),
+            ]
+
+        class USER_INFO_23(ctypes.Structure):
+            _fields_ = [
+                ("usri23_name", wintypes.LPWSTR),
+                ("usri23_full_name", wintypes.LPWSTR),
+                ("usri23_comment", wintypes.LPWSTR),
+                ("usri23_flags", wintypes.DWORD),
+                ("usri23_user_sid", ctypes.c_void_p),
+            ]
+
+        try:
+            advapi32 = ctypes.windll.advapi32
+            kernel32 = ctypes.windll.kernel32
+            netapi32 = ctypes.windll.netapi32
+        except (AttributeError, OSError):
+            return False
+
+        LocalFree = kernel32.LocalFree
+        LocalFree.argtypes = [ctypes.c_void_p]
+        LocalFree.restype = ctypes.c_void_p
+
+        ConvertStringSidToSidW = advapi32.ConvertStringSidToSidW
+        ConvertStringSidToSidW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        ConvertStringSidToSidW.restype = wintypes.BOOL
+
+        ConvertSidToStringSidW = advapi32.ConvertSidToStringSidW
+        ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        ConvertSidToStringSidW.restype = wintypes.BOOL
+
+        LookupAccountSidW = advapi32.LookupAccountSidW
+        LookupAccountSidW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.c_void_p,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        LookupAccountSidW.restype = wintypes.BOOL
+
+        NetApiBufferFree = netapi32.NetApiBufferFree
+        NetApiBufferFree.argtypes = [ctypes.c_void_p]
+        NetApiBufferFree.restype = wintypes.DWORD
+
+        NetLocalGroupGetMembers = netapi32.NetLocalGroupGetMembers
+        NetLocalGroupGetMembers.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        NetLocalGroupGetMembers.restype = wintypes.DWORD
+
+        NetUserEnum = netapi32.NetUserEnum
+        NetUserEnum.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        NetUserEnum.restype = wintypes.DWORD
+
+        def _sid_to_str(sid_ptr):
+            if not sid_ptr:
+                return None
+            str_ptr = ctypes.c_void_p()
+            try:
+                if ConvertSidToStringSidW(sid_ptr, ctypes.byref(str_ptr)) and str_ptr.value:
+                    return ctypes.wstring_at(str_ptr.value)
+            finally:
+                if str_ptr.value:
+                    LocalFree(str_ptr)
+            return None
+
+        # Resolve the localized Administrators group name from well-known SID S-1-5-32-544.
+        admin_group_name = None
+        admin_sid_ptr = ctypes.c_void_p()
+        try:
+            if ConvertStringSidToSidW("S-1-5-32-544", ctypes.byref(admin_sid_ptr)) and admin_sid_ptr.value:
+                name_len = wintypes.DWORD(0)
+                dom_len = wintypes.DWORD(0)
+                sid_use = wintypes.DWORD(0)
+                LookupAccountSidW(
+                    None,
+                    admin_sid_ptr,
+                    None,
+                    ctypes.byref(name_len),
+                    None,
+                    ctypes.byref(dom_len),
+                    ctypes.byref(sid_use),
+                )
+                if name_len.value > 0:
+                    name_buf = ctypes.create_unicode_buffer(name_len.value)
+                    dom_buf = ctypes.create_unicode_buffer(max(dom_len.value, 1))
+                    if LookupAccountSidW(
+                        None,
+                        admin_sid_ptr,
+                        name_buf,
+                        ctypes.byref(name_len),
+                        dom_buf,
+                        ctypes.byref(dom_len),
+                        ctypes.byref(sid_use),
+                    ):
+                        admin_group_name = name_buf.value
+        finally:
+            if admin_sid_ptr.value:
+                LocalFree(admin_sid_ptr)
+
+        MAX_PREFERRED_LENGTH = 0xFFFFFFFF
+        ERROR_MORE_DATA = 234
+        FILTER_NORMAL_ACCOUNT = 0x0002
+        UF_ACCOUNTDISABLE = 0x0002
+
+        admin_sids = set()
+        admin_names = set()
+        if admin_group_name:
+            resume_lg = ctypes.c_size_t(0)
+            while True:
+                buf = ctypes.c_void_p()
+                entries_read = wintypes.DWORD(0)
+                total_entries = wintypes.DWORD(0)
+                status = NetLocalGroupGetMembers(
+                    None,
+                    admin_group_name,
+                    2,
+                    ctypes.byref(buf),
+                    MAX_PREFERRED_LENGTH,
+                    ctypes.byref(entries_read),
+                    ctypes.byref(total_entries),
+                    ctypes.byref(resume_lg),
+                )
+                try:
+                    if status not in (0, ERROR_MORE_DATA):
+                        break
+                    if buf.value and entries_read.value:
+                        arr = ctypes.cast(
+                            buf,
+                            ctypes.POINTER(LOCALGROUP_MEMBERS_INFO_2),
+                        )
+                        for idx in range(entries_read.value):
+                            entry = arr[idx]
+                            sid_str = _sid_to_str(entry.lgrmi2_sid)
+                            if sid_str:
+                                admin_sids.add(sid_str)
+                            if entry.lgrmi2_domainandname:
+                                leaf = entry.lgrmi2_domainandname.rsplit("\\", 1)[-1]
+                                if leaf:
+                                    admin_names.add(leaf.casefold())
+                finally:
+                    if buf.value:
+                        NetApiBufferFree(buf)
+                if status != ERROR_MORE_DATA:
+                    break
+
+        users = []
+        resume_u = wintypes.DWORD(0)
+        while True:
+            buf = ctypes.c_void_p()
+            entries_read = wintypes.DWORD(0)
+            total_entries = wintypes.DWORD(0)
+            status = NetUserEnum(
+                None,
+                23,
+                FILTER_NORMAL_ACCOUNT,
+                ctypes.byref(buf),
+                MAX_PREFERRED_LENGTH,
+                ctypes.byref(entries_read),
+                ctypes.byref(total_entries),
+                ctypes.byref(resume_u),
+            )
+            try:
+                if status not in (0, ERROR_MORE_DATA):
+                    return False
+                if buf.value and entries_read.value:
+                    arr = ctypes.cast(buf, ctypes.POINTER(USER_INFO_23))
+                    for idx in range(entries_read.value):
+                        entry = arr[idx]
+                        uname = entry.usri23_name
+                        if not uname:
+                            continue
+                        sid_str = _sid_to_str(entry.usri23_user_sid)
+                        is_admin = (
+                            (sid_str is not None and sid_str in admin_sids)
+                            or uname.casefold() in admin_names
+                        )
+                        users.append({
+                            "name": uname,
+                            "enabled": not bool(entry.usri23_flags & UF_ACCOUNTDISABLE),
+                            "sid": sid_str,
+                            "administrator_member": is_admin,
+                        })
+            finally:
+                if buf.value:
+                    NetApiBufferFree(buf)
+            if status != ERROR_MORE_DATA:
+                break
+
+        for item in users:
+            if item["administrator_member"]:
+                report["users"]["privileged"].append(item)
+            else:
+                report["users"]["regular"].append(item)
+
+        report["users"]["status"] = "detected"
+        return True
+
     def _windows_users(self, report):
-        # Get-LocalUser and Get-LocalGroupMember may be unavailable
-        # on some Windows editions or in constrained environments.
+        # Skip local SAM enumeration on Domain Controllers.
+        role_val = report.get("domain_role", {}).get("value")
+        if self._is_windows_domain_controller() or role_val in (
+            "Primary Domain Controller",
+            "Backup Domain Controller",
+            "Domain Controller",
+        ):
+            report["users"]["status"] = "not_applicable"
+            report["limitations"].append(
+                "Local user enumeration is skipped on Domain Controllers."
+            )
+            return
+
+        # Prefer locale-independent Win32 NetAPI (zero PowerShell overhead).
+        if self._windows_users_netapi(report):
+            return
+
+        # PowerShell fallback using well-known Administrators SID S-1-5-32-544.
         users = self._powershell(
             "Get-LocalUser | Select-Object Name,Enabled,"
             "@{Name='SID';Expression={$_.SID.Value}} "
@@ -335,7 +586,7 @@ class DomainSettingsAudit:
         )
 
         admins = self._powershell(
-            "Get-LocalGroupMember -Group 'Administrators' "
+            "Get-LocalGroupMember -SID 'S-1-5-32-544' "
             "| Select-Object Name,"
             "@{Name='SID';Expression={$_.SID.Value}},PrincipalSource "
             "| ConvertTo-Json -Compress"
@@ -432,6 +683,51 @@ class DomainSettingsAudit:
                 "This does not prove that LAPS is absent or unconfigured."
             )
 
+    @staticmethod
+    def _ntlm_verdict(
+        lm_level,
+        no_lm_hash,
+        audit,
+        restrict_sending=None,
+        restrict_receiving=None,
+        block_ntlmv1_sso=None,
+    ):
+        """Assess overall NTLM posture using hardened Windows security rules."""
+        # Always flag LM hash storage when explicitly enabled.
+        if no_lm_hash == 0:
+            if lm_level in (0, 1, 2) and block_ntlmv1_sso != 1:
+                return "Critical, Weak NTLM policy (LM/NTLMv1 and LM hashes enabled)"
+            return "Warning, LM hash storage is allowed (NoLMHash=0)"
+
+        # Only supersede LmCompatibilityLevel when BOTH inbound and outbound NTLM are denied.
+        if restrict_receiving == 2 and restrict_sending == 2:
+            if audit == 2:
+                return "Strong, NTLM restricted/blocked and NTLM audit enabled"
+            return "Strong, NTLM restricted/blocked without NTLM auditing"
+
+        # Weak: LM or NTLMv1 sent (0=LM&NTLM, 1=LM&NTLM/NTLMv2, 2=NTLMv1 only).
+        if lm_level in (0, 1, 2):
+            if block_ntlmv1_sso == 1:
+                return "Moderate, Legacy LmCompatibilityLevel set but NTLMv1 SSO blocked"
+            return "Critical, Weak NTLM policy (LM/NTLMv1 enabled)"
+
+        # Moderate: NTLMv2 sent, but NTLMv1 still accepted inbound (None/3/4).
+        if lm_level in (None, 3, 4):
+            if block_ntlmv1_sso == 1:
+                return "Moderate, NTLMv2 is used (NTLMv1 SSO blocked)"
+            if lm_level == 4:
+                return "Moderate, NTLMv2 sent but NTLMv1 still accepted"
+            return "Moderate, NTLMv2 is used but not enforced"
+
+        # Strongest: Send NTLMv2 response only; refuse LM & NTLM (5).
+        if lm_level == 5:
+            suffix = " (NTLMv1 SSO blocked)" if block_ntlmv1_sso == 1 else ""
+            if audit == 2:
+                return f"Strong, NTLMv2 enforced and NTLM audit enabled{suffix}"
+            return f"Strong, NTLMv2 enforced without NTLM auditing{suffix}"
+
+        return "Unknown NTLM configuration"
+
     def _windows_ntlm(self, report):
         lsa = r"SYSTEM\CurrentControlSet\Control\Lsa"
         msv = lsa + r"\MSV1_0"
@@ -482,6 +778,15 @@ class DomainSettingsAudit:
             5: "Send NTLMv2; refuse LM and NTLM",
         }
 
+        verdict = self._ntlm_verdict(
+            lm_level,
+            no_lm_hash,
+            audit,
+            restrict_sending=restrict_sending,
+            restrict_receiving=restrict_receiving,
+            block_ntlmv1_sso=block_ntlmv1_sso,
+        )
+
         report["ntlm_policy"] = {
             "status": "detected",
             "value": {
@@ -496,6 +801,7 @@ class DomainSettingsAudit:
                 "restrict_sending_ntlm_traffic": restrict_sending,
                 "restrict_receiving_ntlm_traffic": restrict_receiving,
                 "block_ntlmv1_sso": block_ntlmv1_sso,
+                "verdict": verdict,
             },
             "source": "Windows registry",
         }

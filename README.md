@@ -13,13 +13,15 @@ pip install secuditor
 Run a specific audit module using its flag (add `--json` for JSON output):
 
 ```bash
-secuditor -com          # System specifications and connected hardware
+secuditor -com          # System specifications, firmware, memory, GPU, and connected hardware
 secuditor -end          # Endpoint security settings (Defender, firewall, BitLocker, UAC, MAC, etc.)
+secuditor -rem          # Remote access services, protocols, and Bluetooth exposure
 secuditor -net          # Network adapters, IPs, gateways, DNS, DHCP, and Wi-Fi
 secuditor -app          # Installed applications inventory
 secuditor -dsa          # Domain affiliation, users, LAPS, NTLM, and NTP
-secuditor -pwd          # Local password policy settings
+secuditor -pwd          # Password policy, lockout settings, and PIN/biometrics
 secuditor -ssl          # SSL/TLS interception and certificate trust inspection
+secuditor -prx          # System/environment proxy settings, PAC scripts, and local proxy listeners
 secuditor -all          # Run all audits in sequence
 ```
 
@@ -27,11 +29,12 @@ Examples:
 
 ```bash
 secuditor -all --json
-secuditor -net --json
+secuditor -rem --json
+secuditor -prx --json
 secuditor --version
 ```
 
-Long flag aliases (`--domain`, `--endpoint`, `--network`, `--apps`, `--password`, `--ssl`, `--system`, `--all`) are also supported.
+Long flag aliases (`--system`, `--endpoint`, `--remote`, `--network`, `--apps`, `--domain`, `--password`, `--ssl`, `--proxy`, `--all`) are also supported.
 
 ## Python Library Usage
 
@@ -39,13 +42,15 @@ Audit classes are lazily loaded from `secuditor` and expose an `.audit()` method
 
 ```python
 from secuditor import (
-    DomainAudit,
+    SystemSettings,
     SecurityAudit,
+    RemoteAccessSettings,
     NetworkSettings,
     InstalledApps,
+    DomainAudit,
     PasswordPolicy,
     SSLInterception,
-    SystemSettings,
+    SuspiciousProxy,
     FullAudit,
 )
 

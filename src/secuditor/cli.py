@@ -13,14 +13,16 @@ from . import __version__
 _AUDIT_SPECS = {
     "com": (".system_settings", "SystemSettings", "System Settings Audit"),
     "end": (".endpoint_security", "SecurityAudit", "Endpoint Security Audit"),
+    "rem": (".remote_access", "RemoteAccessSettings", "Remote Access Settings Audit"),
     "net": (".network_settings", "NetworkSettings", "Network Settings Audit"),
     "app": (".installed_apps", "InstalledApps", "Installed Applications Audit"),
     "dsa": (".domain_settings", "DomainAudit", "Domain Settings Audit"),
     "pwd": (".password_policy", "PasswordPolicy", "Password Policy Audit"),
     "ssl": (".ssl_interception", "SSLInterception", "SSL Interception Audit"),
+    "prx": (".suspicious_proxy", "SuspiciousProxy", "Suspicious Proxy Audit"),
 }
 
-_ALL_ORDER = ("com", "end", "net", "app", "dsa", "pwd", "ssl")
+_ALL_ORDER = ("com", "end", "rem", "net", "app", "dsa", "pwd", "ssl", "prx")
 
 
 class FullAudit:
@@ -78,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit endpoint security",
     )
     group.add_argument(
+        "-rem",
+        "--remote",
+        dest="audit",
+        action="store_const",
+        const="rem",
+        help="Audit remote access settings",
+    )
+    group.add_argument(
         "-net",
         "--network",
         dest="audit",
@@ -116,6 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const="ssl",
         help="Audit SSL/TLS interception",
+    )
+    group.add_argument(
+        "-prx",
+        "--proxy",
+        dest="audit",
+        action="store_const",
+        const="prx",
+        help="Audit proxy settings and local proxy listeners",
     )
     group.add_argument(
         "-all",
@@ -157,14 +175,24 @@ _SECTION_DIVIDER_KEYS = {
     "global_policy",
     "fingerprint_sha256",
     "ssl_interception_detected",
+    "analysis",
+    "configuration",
+    "listener",
+    "SMB1",
+    "SMB / Samba",
+    "File Sharing (SMB)",
+    "PKU2U Authentication",
+    "Bluetooth",
 }
 
 _LABEL_REPLACEMENTS = {
     "os": "OS",
     "cpu": "CPU",
+    "gpu": "GPU",
     "mhz": "MHz",
     "ram": "RAM",
     "gb": "GB",
+    "pin": "PIN",
     "usb": "USB",
     "asr": "ASR",
     "uac": "UAC",
@@ -190,6 +218,26 @@ _LABEL_REPLACEMENTS = {
     "ssl": "SSL",
     "aslr": "ASLR",
     "filevault": "FileVault",
+    "pac": "PAC",
+    "wpad": "WPAD",
+    "winhttp": "WinHTTP",
+    "portproxy": "PortProxy",
+    "winrm": "WinRM",
+    "smb1": "SMB1",
+    "smb2": "SMB2",
+    "smb": "SMB",
+    "ftp": "FTP",
+    "tftp": "TFTP",
+    "rpc": "RPC",
+    "pku2u": "PKU2U",
+    "dcom": "DCOM",
+    "netbios": "NetBIOS",
+    "upnphost": "UPnPHost",
+    "ssh": "SSH",
+    "xrdp": "XRDP",
+    "vnc": "VNC",
+    "nfs": "NFS",
+    "cups": "CUPS",
 }
 
 

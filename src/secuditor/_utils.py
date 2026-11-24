@@ -12,8 +12,11 @@ from typing import Any
 _IS_WINDOWS = sys.platform == "win32"
 
 _WINDOWS_BUILTIN_COMMANDS = {
+    "bthprops.cpl",
     "dsregcmd",
     "dsregcmd.exe",
+    "ipconfig",
+    "ipconfig.exe",
     "net",
     "net.exe",
     "netsh",
@@ -85,13 +88,15 @@ def _sanitize_path_env(raw_path: str | None) -> str:
     return os.pathsep.join(safe_parts)
 
 
-def _safe_subproc_env() -> dict[str, str]:
+def _safe_subproc_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
     """Return a subprocess environment hardened against CWD/relative PATH lookup."""
     env = dict(os.environ)
     if _IS_WINDOWS:
         env.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
     if "PATH" in env or not _IS_WINDOWS:
         env["PATH"] = _sanitize_path_env(env.get("PATH"))
+    if extra_env:
+        env.update(extra_env)
     return env
 
 
@@ -108,6 +113,7 @@ def _windows_subproc_kwargs() -> dict[str, Any]:
 def run_command_result(
     args: list[str],
     timeout: float = 8.0,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, str] | None:
     """Run a command safely without a shell and return (returncode, stdout, stderr)."""
     if not args:
@@ -123,7 +129,7 @@ def run_command_result(
             timeout=timeout,
             check=False,
             shell=False,
-            env=_safe_subproc_env(),
+            env=_safe_subproc_env(extra_env=extra_env),
             **_windows_subproc_kwargs(),
         )
         return result.returncode, result.stdout, result.stderr
@@ -135,9 +141,10 @@ def run_command(
     args: list[str],
     timeout: float = 8.0,
     strip: bool = True,
+    extra_env: dict[str, str] | None = None,
 ) -> str | None:
     """Run a command without a shell and return stdout on success, else None."""
-    result = run_command_result(args, timeout=timeout)
+    result = run_command_result(args, timeout=timeout, extra_env=extra_env)
     if result is None:
         return None
     returncode, stdout, _ = result
@@ -160,6 +167,7 @@ def run_powershell(
     timeout: float = 8.0,
     parse_json: bool = True,
     stop_on_error: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> Any:
     """Run a PowerShell command non-interactively and optionally parse JSON."""
     executable = find_powershell()
@@ -182,6 +190,7 @@ def run_powershell(
             script,
         ],
         timeout=timeout,
+        extra_env=extra_env,
     )
 
     if not output:

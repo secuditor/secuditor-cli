@@ -7,8 +7,10 @@ from secuditor import (
     InstalledApps,
     NetworkSettings,
     PasswordPolicy,
+    RemoteAccessSettings,
     SSLInterception,
     SecurityAudit,
+    SuspiciousProxy,
     SystemSettings,
     __version__,
 )
@@ -22,10 +24,12 @@ class TestPackageImports(unittest.TestCase):
         classes = [
             DomainAudit,
             SecurityAudit,
+            RemoteAccessSettings,
             NetworkSettings,
             InstalledApps,
             PasswordPolicy,
             SSLInterception,
+            SuspiciousProxy,
             SystemSettings,
             FullAudit,
         ]

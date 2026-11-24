@@ -74,6 +74,9 @@ class SecuritySettingsAudit:
             "$av = @(Get-CimInstance -Namespace 'root/SecurityCenter2' "
             "-ClassName AntiVirusProduct -ErrorAction SilentlyContinue "
             "| Select-Object displayName,productState); "
+            "$fw = @(Get-CimInstance -Namespace 'root/SecurityCenter2' "
+            "-ClassName FirewallProduct -ErrorAction SilentlyContinue "
+            "| Select-Object displayName,productState); "
             "$dep = $null; "
             "try { $dep = (Get-CimInstance Win32_OperatingSystem "
             "-ErrorAction SilentlyContinue).DataExecutionPrevention_SupportPolicy } catch {}; "
@@ -102,7 +105,7 @@ class SecuritySettingsAudit:
             "try { $sb_wmi = (Get-CimInstance -Namespace 'root\\Microsoft\\Windows\\HardwareManagement' "
             "-ClassName MS_SecureBoot -ErrorAction SilentlyContinue).SecureBootEnabled } catch {}; "
             "[PSCustomObject]@{ "
-            "defender = $def; av = $av; dep = $dep; dg_running = $dg_run; "
+            "defender = $def; av = $av; fw = $fw; dep = $dep; dg_running = $dg_run; "
             "exec_policy = $ep; bitlocker = $bl; sb_wmi = $sb_wmi "
             "} | ConvertTo-Json -Depth 4 -Compress"
         )
@@ -122,8 +125,38 @@ class SecuritySettingsAudit:
         return {"managed": False, "product_name": None}
 
     @staticmethod
-    def _windows_firewall_state():
+    def _parse_sc2_products(raw_items):
+        """Decode SecurityCenter2 product entries into (display_name, is_active | None)."""
+        if isinstance(raw_items, dict):
+            items = [raw_items]
+        elif isinstance(raw_items, list):
+            items = raw_items
+        else:
+            return []
+
+        parsed = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("displayName") or "").strip()
+            if not name:
+                continue
+            try:
+                state = int(item.get("productState"))
+                # SecurityCenter2 state nibble (0xF000): 0x1000 = enabled/active
+                active = (state & 0xF000) == 0x1000
+            except (TypeError, ValueError):
+                active = None
+            parsed.append((name, active))
+        return parsed
+
+    def _windows_firewall_state(self):
         try:
+            # Verify the Windows Defender Firewall service (mpssvc) is running.
+            svc_out = (self._run(["sc.exe", "query", "mpssvc"]) or "").upper()
+            if "STOPPED" in svc_out or "STOP_PENDING" in svc_out:
+                return "Off"
+
             import winreg
 
             profiles = {"Domain": True, "Private": True, "Public": True}
@@ -624,8 +657,12 @@ class SecuritySettingsAudit:
 
         # 1. Windows Defender
         def_info = ps_data.get("defender")
-        if isinstance(def_info, dict) and def_info.get("AMServiceEnabled") is not None:
-            active = bool(def_info.get("AMServiceEnabled"))
+        if isinstance(def_info, dict) and def_info:
+            active = (
+                def_info.get("AMServiceEnabled") is True
+                and def_info.get("AntivirusEnabled") is True
+                and def_info.get("RealTimeProtectionEnabled") is True
+            )
             result["Windows Defender"].append(
                 f"Windows Defender ({'Active' if active else 'Inactive'})"
             )
@@ -639,36 +676,36 @@ class SecuritySettingsAudit:
                 result["Windows Defender"].append("Windows Defender (Unknown)")
 
         # 2. Third-party Endpoint Protection (SecurityCenter2)
-        av_items = ps_data.get("av") or []
-        if isinstance(av_items, dict):
-            av_items = [av_items]
-        if isinstance(av_items, list):
-            for item in av_items:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("displayName") or "").strip()
-                if not name or name.lower() == "windows defender":
-                    continue
-                try:
-                    state = int(item.get("productState"))
-                    active = (state & 0xF000) == 0x1000
-                    result["Endpoint Protection"].append(
-                        f"{name} ({'Active' if active else 'Inactive'})"
-                    )
-                except (TypeError, ValueError):
-                    result["Endpoint Protection"].append(f"{name} (Unknown)")
+        for name, active in self._parse_sc2_products(ps_data.get("av")):
+            if name.lower() == "windows defender":
+                continue
+            if active is None:
+                result["Endpoint Protection"].append(f"{name} (Unknown)")
+            else:
+                result["Endpoint Protection"].append(
+                    f"{name} ({'Active' if active else 'Inactive'})"
+                )
 
-        # 3. Host-based Firewall
-        fw_info = self._windows_firewall_managed_by()
-        controller = (
-            fw_info["product_name"]
-            if fw_info["managed"]
-            else "Windows Firewall"
-        )
-        fw_state = self._windows_firewall_state()
-        result["Host-based Firewall"] = (
-            f"{controller} ({fw_state})" if fw_state != "Unknown" else "Unknown"
-        )
+        # 3. Host-based Firewall (SecurityCenter2 3rd-party aware + Windows Firewall fallback)
+        active_3p_fw = None
+        for fw_name, fw_active in self._parse_sc2_products(ps_data.get("fw")):
+            if fw_active is True and fw_name.lower() != "windows firewall":
+                active_3p_fw = fw_name
+                break
+
+        if active_3p_fw:
+            result["Host-based Firewall"] = f"{active_3p_fw} (On)"
+        else:
+            fw_info = self._windows_firewall_managed_by()
+            controller = (
+                fw_info["product_name"]
+                if fw_info["managed"]
+                else "Windows Firewall"
+            )
+            fw_state = self._windows_firewall_state()
+            result["Host-based Firewall"] = (
+                f"{controller} ({fw_state})" if fw_state != "Unknown" else "Unknown"
+            )
 
         # 4. Auto Screen Lock
         result["Auto Screen Lock"] = self._windows_auto_screen_lock()

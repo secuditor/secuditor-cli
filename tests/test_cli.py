@@ -12,18 +12,22 @@ class TestCLI(unittest.TestCase):
         cases = [
             ("-dsa", "dsa"),
             ("-end", "end"),
+            ("-rem", "rem"),
             ("-net", "net"),
             ("-app", "app"),
             ("-pwd", "pwd"),
             ("-ssl", "ssl"),
+            ("-prx", "prx"),
             ("-com", "com"),
             ("-all", "all"),
             ("--domain", "dsa"),
             ("--endpoint", "end"),
+            ("--remote", "rem"),
             ("--network", "net"),
             ("--apps", "app"),
             ("--password", "pwd"),
             ("--ssl", "ssl"),
+            ("--proxy", "prx"),
             ("--system", "com"),
             ("--all", "all"),
         ]
@@ -70,7 +74,7 @@ class TestCLI(unittest.TestCase):
             {"platform": "TestOS", "ok": True},
         )
 
-    def test_main_all_runs_all_seven_in_requested_order(self):
+    def test_main_all_runs_all_audits_in_requested_order(self):
         called_order = []
 
         def fake_import(module_name, package=None):
@@ -84,10 +88,12 @@ class TestCLI(unittest.TestCase):
             for _, cls_name, _ in [
                 (".domain_settings", "DomainAudit", ""),
                 (".endpoint_security", "SecurityAudit", ""),
+                (".remote_access", "RemoteAccessSettings", ""),
                 (".network_settings", "NetworkSettings", ""),
                 (".installed_apps", "InstalledApps", ""),
                 (".password_policy", "PasswordPolicy", ""),
                 (".ssl_interception", "SSLInterception", ""),
+                (".suspicious_proxy", "SuspiciousProxy", ""),
                 (".system_settings", "SystemSettings", ""),
             ]:
                 setattr(mod, cls_name, FakeAudit)
@@ -102,11 +108,13 @@ class TestCLI(unittest.TestCase):
         expected_modules = [
             ".system_settings",
             ".endpoint_security",
+            ".remote_access",
             ".network_settings",
             ".installed_apps",
             ".domain_settings",
             ".password_policy",
             ".ssl_interception",
+            ".suspicious_proxy",
         ]
         self.assertEqual(called_order, expected_modules)
         payload = json.loads(stdout.getvalue())

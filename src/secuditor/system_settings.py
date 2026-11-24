@@ -23,6 +23,30 @@ __all__ = ["SystemSettings", "SystemSettingsAudit"]
 class SystemSettingsAudit:
     """Collect system inventory and discover hardware where supported."""
 
+    _SMBIOS_MEMORY_TYPES = {
+        20: "DDR",
+        21: "DDR2",
+        22: "DDR2 FB-DIMM",
+        24: "DDR3",
+        26: "DDR4",
+        27: "LPDDR",
+        28: "LPDDR2",
+        29: "LPDDR3",
+        30: "LPDDR4",
+        34: "DDR5",
+        35: "LPDDR5",
+        36: "LPDDR5X",
+    }
+
+    _VIRTUAL_GPU_MARKERS = (
+        "microsoft basic display",
+        "microsoft remote display",
+        "citrix indirect",
+        "parsec virtual",
+        "idd sample",
+        "luminoncore",
+    )
+
     def __init__(self, timeout=8):
         self.timeout = timeout
         self.system = platform.system()
@@ -108,12 +132,221 @@ class SystemSettingsAudit:
             return "UEFI/Apple Silicon" if platform.machine() == "arm64" else "UEFI"
         return "Unknown"
 
+    @classmethod
+    def _parse_windows_hardware_cim(cls, payload):
+        """Parse BIOS version, physical memory speed/type, and GPU details."""
+        if not isinstance(payload, dict):
+            payload = {}
+
+        bios_raw = payload.get("bios")
+        firmware_version = str(bios_raw).strip() if bios_raw else "Unknown"
+
+        def _as_dict_list(val):
+            if isinstance(val, dict):
+                return [val]
+            if isinstance(val, list):
+                return [item for item in val if isinstance(item, dict)]
+            return []
+
+        speeds = []
+        mem_types = []
+        for dimm in _as_dict_list(payload.get("memory")):
+            speed_val = None
+            for skey in ("ConfiguredClockSpeed", "Speed"):
+                raw_s = dimm.get(skey)
+                try:
+                    iv = int(raw_s)
+                    if iv > 0:
+                        speed_val = iv
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if speed_val is not None:
+                s_label = f"{speed_val} MHz"
+                if s_label not in speeds:
+                    speeds.append(s_label)
+
+            m_label = None
+            for tkey in ("SMBIOSMemoryType", "MemoryType"):
+                raw_t = dimm.get(tkey)
+                try:
+                    tv = int(raw_t)
+                    if tv in cls._SMBIOS_MEMORY_TYPES:
+                        m_label = cls._SMBIOS_MEMORY_TYPES[tv]
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if m_label and m_label not in mem_types:
+                mem_types.append(m_label)
+
+        raw_gpus = _as_dict_list(payload.get("gpus"))
+        physical_gpus = []
+        for gpu in raw_gpus:
+            g_name = str(
+                gpu.get("Name") or gpu.get("VideoProcessor") or ""
+            ).strip().lower()
+            if g_name and not any(
+                marker in g_name for marker in cls._VIRTUAL_GPU_MARKERS
+            ):
+                physical_gpus.append(gpu)
+        selected_gpus = physical_gpus if physical_gpus else raw_gpus
+
+        gpu_makers = []
+        gpu_models = []
+        for gpu in selected_gpus:
+            maker = str(gpu.get("AdapterCompatibility") or "").strip()
+            model = str(
+                gpu.get("Name") or gpu.get("VideoProcessor") or ""
+            ).strip()
+            if maker and maker not in gpu_makers:
+                gpu_makers.append(maker)
+            if model and model not in gpu_models:
+                gpu_models.append(model)
+
+        return {
+            "firmware_version": firmware_version or "Unknown",
+            "memory_type": ", ".join(mem_types) if mem_types else "Unknown",
+            "memory_speed": ", ".join(speeds) if speeds else "Unknown",
+            "gpu_manufacturer": ", ".join(gpu_makers) if gpu_makers else "Unknown",
+            "gpu_model": ", ".join(gpu_models) if gpu_models else "Unknown",
+        }
+
+    def _hardware_details(self):
+        """Collect firmware version, memory type/speed, and GPU details."""
+        defaults = {
+            "firmware_version": "Unknown",
+            "memory_type": "Unknown",
+            "memory_speed": "Unknown",
+            "gpu_manufacturer": "Unknown",
+            "gpu_model": "Unknown",
+        }
+
+        if self.system == "Windows":
+            if not find_powershell():
+                return defaults
+            ps_cmd = (
+                "@{ "
+                "bios = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction SilentlyContinue "
+                "| Select-Object -First 1 -ExpandProperty SMBIOSBIOSVersion); "
+                "memory = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction SilentlyContinue "
+                "| Select-Object ConfiguredClockSpeed,Speed,SMBIOSMemoryType,MemoryType); "
+                "gpus = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue "
+                "| Select-Object AdapterCompatibility,Name,VideoProcessor) "
+                "} | ConvertTo-Json -Compress -Depth 3"
+            )
+            payload = run_powershell(ps_cmd, timeout=self.timeout, parse_json=True)
+            return self._parse_windows_hardware_cim(payload)
+
+        if self.system == "Linux":
+            details = dict(defaults)
+            try:
+                with open(
+                    "/sys/class/dmi/id/bios_version",
+                    encoding="utf-8",
+                    errors="replace",
+                ) as f:
+                    ver = f.read().strip()
+                    if ver:
+                        details["firmware_version"] = ver
+            except OSError:
+                pass
+
+            if shutil.which("lspci"):
+                out = self._run(["lspci"])
+                if out:
+                    models = []
+                    makers = []
+                    for line in out.splitlines():
+                        if not re.search(
+                            r"\b(VGA compatible controller|3D controller|Display controller)\b",
+                            line,
+                            re.IGNORECASE,
+                        ):
+                            continue
+                        parts = line.split(":", 2)
+                        desc = parts[2].strip() if len(parts) >= 3 else line.strip()
+                        if desc and desc not in models:
+                            models.append(desc)
+                            maker = desc.split()[0]
+                            if maker and maker not in makers:
+                                makers.append(maker)
+                    if models:
+                        details["gpu_model"] = ", ".join(models)
+                    if makers:
+                        details["gpu_manufacturer"] = ", ".join(makers)
+            return details
+
+        if self.system == "Darwin":
+            details = dict(defaults)
+            out = self._run([
+                "system_profiler",
+                "SPHardwareDataType",
+                "SPDisplaysDataType",
+                "SPMemoryDataType",
+                "-json",
+            ])
+            if out:
+                try:
+                    data = json.loads(out)
+                except json.JSONDecodeError:
+                    return details
+
+                hw_items = data.get("SPHardwareDataType") or []
+                if isinstance(hw_items, list) and hw_items and isinstance(hw_items[0], dict):
+                    fw = (
+                        hw_items[0].get("system_firmware_version")
+                        or hw_items[0].get("boot_rom_version")
+                    )
+                    if fw:
+                        details["firmware_version"] = str(fw).strip()
+
+                gpu_makers = []
+                gpu_models = []
+                for item in data.get("SPDisplaysDataType") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    maker = str(item.get("sppci_vendor") or "").strip()
+                    model = str(item.get("sppci_model") or "").strip()
+                    if maker and maker not in gpu_makers:
+                        gpu_makers.append(maker)
+                    if model and model not in gpu_models:
+                        gpu_models.append(model)
+                if gpu_makers:
+                    details["gpu_manufacturer"] = ", ".join(gpu_makers)
+                if gpu_models:
+                    details["gpu_model"] = ", ".join(gpu_models)
+
+                mem_types = []
+                mem_speeds = []
+                for block in data.get("SPMemoryDataType") or []:
+                    if not isinstance(block, dict):
+                        continue
+                    entries = block.get("_items") if isinstance(block.get("_items"), list) else [block]
+                    for dimm in entries:
+                        if not isinstance(dimm, dict):
+                            continue
+                        mtype = str(dimm.get("dimm_type") or "").strip()
+                        mspeed = str(dimm.get("dimm_speed") or "").strip()
+                        if mtype and mtype.lower() != "empty" and mtype not in mem_types:
+                            mem_types.append(mtype)
+                        if mspeed and mspeed.lower() != "empty" and mspeed not in mem_speeds:
+                            mem_speeds.append(mspeed)
+                if mem_types:
+                    details["memory_type"] = ", ".join(mem_types)
+                if mem_speeds:
+                    details["memory_speed"] = ", ".join(mem_speeds)
+            return details
+
+        return defaults
+
     def get_system_settings(self):
         memory = psutil.virtual_memory()
         try:
             cpu_freq = psutil.cpu_freq()
         except Exception:
             cpu_freq = None
+
+        hw_details = self._hardware_details()
 
         resources = {
             "Machine": platform.machine() or None,
@@ -127,6 +360,10 @@ class SystemSettingsAudit:
                 else None
             ),
             "RAM (GB)": round(memory.total / (1024 ** 3), 2),
+            "Memory Type": hw_details["memory_type"],
+            "Memory Speed": hw_details["memory_speed"],
+            "GPU Manufacturer": hw_details["gpu_manufacturer"],
+            "GPU Model": hw_details["gpu_model"],
         }
 
         disks = {}
@@ -161,6 +398,7 @@ class SystemSettingsAudit:
             "OS Release": platform.release(),
             "OS Version": platform.version(),
             "Firmware": self._firmware_type(),
+            "Firmware Version": hw_details["firmware_version"],
             "Resources": resources,
             "Disks": disks,
         }
