@@ -113,8 +113,8 @@ class TestCLI(unittest.TestCase):
             ".installed_apps",
             ".domain_settings",
             ".password_policy",
-            ".ssl_interception",
             ".suspicious_proxy",
+            ".ssl_interception",
         ]
         self.assertEqual(called_order, expected_modules)
         payload = json.loads(stdout.getvalue())

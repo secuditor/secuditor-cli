@@ -18,11 +18,11 @@ _AUDIT_SPECS = {
     "app": (".installed_apps", "InstalledApps", "Installed Applications Audit"),
     "dsa": (".domain_settings", "DomainAudit", "Domain Settings Audit"),
     "pwd": (".password_policy", "PasswordPolicy", "Password Policy Audit"),
-    "ssl": (".ssl_interception", "SSLInterception", "SSL Interception Audit"),
     "prx": (".suspicious_proxy", "SuspiciousProxy", "Suspicious Proxy Audit"),
+    "ssl": (".ssl_interception", "SSLInterception", "SSL Interception Audit"),
 }
 
-_ALL_ORDER = ("com", "end", "rem", "net", "app", "dsa", "pwd", "ssl", "prx")
+_ALL_ORDER = ("com", "end", "rem", "net", "app", "dsa", "pwd", "prx", "ssl")
 
 
 class FullAudit:
@@ -120,20 +120,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit password policy",
     )
     group.add_argument(
-        "-ssl",
-        "--ssl",
-        dest="audit",
-        action="store_const",
-        const="ssl",
-        help="Audit SSL/TLS interception",
-    )
-    group.add_argument(
         "-prx",
         "--proxy",
         dest="audit",
         action="store_const",
         const="prx",
         help="Audit proxy settings and local proxy listeners",
+    )
+    group.add_argument(
+        "-ssl",
+        "--ssl",
+        dest="audit",
+        action="store_const",
+        const="ssl",
+        help="Audit SSL/TLS interception",
     )
     group.add_argument(
         "-all",

@@ -18,7 +18,7 @@ from secuditor import (
 
 class TestPackageImports(unittest.TestCase):
     def test_package_version(self):
-        self.assertEqual(__version__, "0.7.0")
+        self.assertEqual(__version__, "0.8.0")
 
     def test_public_classes_are_importable(self):
         classes = [

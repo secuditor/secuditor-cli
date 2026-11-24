@@ -20,8 +20,8 @@ secuditor -net          # Network adapters, IPs, gateways, DNS, DHCP, and Wi-Fi
 secuditor -app          # Installed applications inventory
 secuditor -dsa          # Domain affiliation, users, LAPS, NTLM, and NTP
 secuditor -pwd          # Password policy, lockout settings, and PIN/biometrics
-secuditor -ssl          # SSL/TLS interception and certificate trust inspection
 secuditor -prx          # System/environment proxy settings, PAC scripts, and local proxy listeners
+secuditor -ssl          # SSL/TLS interception and certificate trust inspection
 secuditor -all          # Run all audits in sequence
 ```
 
@@ -34,7 +34,7 @@ secuditor -prx --json
 secuditor --version
 ```
 
-Long flag aliases (`--system`, `--endpoint`, `--remote`, `--network`, `--apps`, `--domain`, `--password`, `--ssl`, `--proxy`, `--all`) are also supported.
+Long flag aliases (`--system`, `--endpoint`, `--remote`, `--network`, `--apps`, `--domain`, `--password`, `--proxy`, `--ssl`, `--all`) are also supported.
 
 ## Python Library Usage
 
@@ -49,8 +49,8 @@ from secuditor import (
     InstalledApps,
     DomainAudit,
     PasswordPolicy,
-    SSLInterception,
     SuspiciousProxy,
+    SSLInterception,
     FullAudit,
 )
 
