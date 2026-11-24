@@ -15,12 +15,14 @@ from cryptography.x509.oid import NameOID
 
 from secuditor import (
     DomainAudit,
+    GatewayDiscovery,
     InstalledApps,
     NetworkSettings,
     PasswordPolicy,
     RemoteAccessSettings,
     SSLInterception,
     SecurityAudit,
+    SharedFolders,
     SuspiciousProxy,
     SystemSettings,
 )
@@ -1021,6 +1023,109 @@ class TestRemoteAccessAudit(unittest.TestCase):
         self.assertIn("High Risk", checks["SSH Service"])
         self.assertEqual(checks["Print Service (CUPS)"], "Enabled, Low Risk (Loopback only)")
         self.assertEqual(checks["Bluetooth"], "Enabled, Exposure Detected (Discoverable)")
+
+
+class TestSharedFoldersAudit(unittest.TestCase):
+    def test_windows_shares_skips_admin_ipc_and_counts_exposed(self):
+        audit = SharedFolders()
+        audit.system = "Windows"
+
+        raw_shares = [
+            {"Name": "ADMIN$", "Path": r"C:\Windows", "Description": "Remote Admin"},
+            {"Name": "IPC$", "Path": "", "Description": "Remote IPC"},
+            {"Name": "C$", "Path": "C:\\", "Description": "Default share"},
+            {"Name": "PublicDocs", "Path": r"D:\PublicDocs", "Description": "Team docs"},
+        ]
+
+        def fake_dacl(path):
+            if path == r"D:\PublicDocs":
+                return ["Everyone: Read, Write"], True
+            return ["BUILTIN\\Administrators: Full Control"], False
+
+        with (
+            patch.object(audit, "_windows_shares_netapi", return_value=raw_shares),
+            patch.object(audit, "_windows_dacl_permissions", side_effect=fake_dacl),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["count"], 2)
+        self.assertEqual(report["exposed_count"], 1)
+        by_name = {s["name"]: s for s in report["shares"]}
+        self.assertNotIn("ADMIN$", by_name)
+        self.assertNotIn("IPC$", by_name)
+        self.assertTrue(by_name["C$"]["admin_share"])
+        self.assertTrue(by_name["PublicDocs"]["everyone_accessible"])
+
+    def test_linux_parses_samba_and_nfs_exports(self):
+        audit = SharedFolders()
+        audit.system = "Linux"
+
+        smb_conf = (
+            "[global]\nworkgroup = WORKGROUP\n"
+            "[shared]\npath = /srv/shared\ncomment = Team share\nguest ok = yes\nread only = no\n"
+        )
+        exports_txt = "/srv/nfs *(rw,sync,no_root_squash)\n"
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/etc/samba/smb.conf":
+                return io.StringIO(smb_conf)
+            if path == "/etc/exports":
+                return io.StringIO(exports_txt)
+            return real_open(path, *args, **kwargs)
+
+        with (
+            patch("shutil.which", return_value=None),
+            patch("builtins.open", side_effect=fake_open),
+            patch.object(audit, "_posix_path_permissions", return_value=(["POSIX mode: 0o755"], False)),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["count"], 2)
+        self.assertEqual(report["exposed_count"], 2)
+        protocols = {s["name"]: s["protocol"] for s in report["shares"]}
+        self.assertEqual(protocols["shared"], "SMB")
+        self.assertEqual(protocols["/srv/nfs"], "NFS")
+
+
+class TestGatewayDiscoveryAudit(unittest.TestCase):
+    def test_vendor_oui_virtual_mac_and_classification(self):
+        audit = GatewayDiscovery()
+        self.assertEqual(audit.lookup_vendor("90-6C-AC-11-22-33"), "Fortinet (Firewall)")
+        self.assertEqual(audit.lookup_vendor("02:11:22:33:44:55"), "Virtual/Software MAC")
+        self.assertEqual(
+            audit.lookup_vendor("00:00:0C:AA:BB:CC", fingerprint_text="Cisco ASA"),
+            "Cisco Systems (Firewall)",
+        )
+        self.assertEqual(
+            audit.lookup_vendor("00:11:22:33:44:55", ping_reply="Reply from 192.168.1.1: bytes=32 time=1ms TTL=64"),
+            "Likely Linux/Unix device",
+        )
+
+    def test_detect_gateway_device_offline_mocked(self):
+        audit = GatewayDiscovery()
+        audit.system = "Windows"
+
+        with (
+            patch.object(audit, "get_default_gateway", return_value={"IPv4": "192.168.1.1", "IPv6": None}),
+            patch.object(audit, "ping_device", return_value="Reply from 192.168.1.1: bytes=32 time=1ms TTL=64"),
+            patch.object(audit, "get_mac_from_arp", return_value="90:6c:ac:aa:bb:cc"),
+            patch.object(audit, "check_http_access", return_value=("HTTPS Responding (Self-Signed/Untrusted Cert)", "FortiGate")),
+            patch.object(audit, "_active_interface_info", return_value=("192.168.1.50", "192.168.1.0/24", "1500 bytes")),
+            patch.object(audit, "detect_management_ports", return_value="HTTPS (443)"),
+            patch.object(audit, "get_external_ip", return_value="93.184.216.34"),
+            patch.object(audit, "get_proxy_configuration", return_value="No Proxy Detected"),
+            patch.object(audit, "detect_vpn", return_value="Not Detected"),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["gateway"]["ip"], "192.168.1.1")
+        self.assertEqual(report["gateway"]["vendor"], "Fortinet (Firewall)")
+        self.assertEqual(report["gateway"]["network_cidr"], "192.168.1.0/24")
+        self.assertEqual(report["gateway"]["mtu"], "1500 bytes")
+        self.assertEqual(report["exposure"]["management_ports"], "HTTPS (443)")
+        self.assertEqual(report["connectivity"]["nat"], "Detected")
+        self.assertEqual(report["connectivity"]["public_ip"], "93.184.216.34")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ Run a specific audit module using its flag (add `--json` for JSON output):
 secuditor -com          # System specifications, firmware, memory, GPU, and connected hardware
 secuditor -end          # Endpoint security settings (Defender, firewall, BitLocker, UAC, MAC, etc.)
 secuditor -rem          # Remote access services, protocols, and Bluetooth exposure
+secuditor -smb          # Shared folders, network exports, and access permissions
 secuditor -net          # Network adapters, IPs, gateways, DNS, DHCP, and Wi-Fi
+secuditor -gds          # Default gateway discovery, management ports, NAT, and VPN
 secuditor -app          # Installed applications inventory
 secuditor -dsa          # Domain affiliation, users, LAPS, NTLM, and NTP
 secuditor -pwd          # Password policy, lockout settings, and PIN/biometrics
@@ -29,12 +31,12 @@ Examples:
 
 ```bash
 secuditor -all --json
-secuditor -rem --json
-secuditor -prx --json
+secuditor -end --json
+secuditor -pwd --json
 secuditor --version
 ```
 
-Long flag aliases (`--system`, `--endpoint`, `--remote`, `--network`, `--apps`, `--domain`, `--password`, `--proxy`, `--ssl`, `--all`) are also supported.
+Long flag aliases (`--system`, `--endpoint`, `--remote`, `--shares`, `--network`, `--gateway`, `--apps`, `--domain`, `--password`, `--proxy`, `--ssl`, `--all`) are also supported.
 
 ## Python Library Usage
 
@@ -45,7 +47,9 @@ from secuditor import (
     SystemSettings,
     SecurityAudit,
     RemoteAccessSettings,
+    SharedFolders,
     NetworkSettings,
+    GatewayDiscovery,
     InstalledApps,
     DomainAudit,
     PasswordPolicy,

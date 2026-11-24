@@ -12,6 +12,8 @@ from typing import Any
 _IS_WINDOWS = sys.platform == "win32"
 
 _WINDOWS_BUILTIN_COMMANDS = {
+    "arp",
+    "arp.exe",
     "bthprops.cpl",
     "dsregcmd",
     "dsregcmd.exe",
@@ -21,6 +23,8 @@ _WINDOWS_BUILTIN_COMMANDS = {
     "net.exe",
     "netsh",
     "netsh.exe",
+    "ping",
+    "ping.exe",
     "powershell",
     "powershell.exe",
     "sc",

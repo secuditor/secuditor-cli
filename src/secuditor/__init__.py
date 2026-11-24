@@ -4,7 +4,7 @@
 
 from importlib import import_module
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 __author__ = "Menahem Levinski"
 __license__ = "MIT"
 
@@ -15,11 +15,13 @@ __all__ = [
     "DomainAudit",
     "SecurityAudit",
     "RemoteAccessSettings",
+    "SharedFolders",
     "NetworkSettings",
+    "GatewayDiscovery",
     "InstalledApps",
     "PasswordPolicy",
-    "SSLInterception",
     "SuspiciousProxy",
+    "SSLInterception",
     "SystemSettings",
     "FullAudit",
 ]
@@ -32,8 +34,13 @@ _MODULES = {
     "EndpointSecurity": ".endpoint_security",
     "RemoteAccessSettings": ".remote_access",
     "RemoteAccessAudit": ".remote_access",
+    "SharedFolders": ".shared_folders",
+    "SharedFoldersAudit": ".shared_folders",
     "NetworkSettings": ".network_settings",
     "NetworkSettingsAudit": ".network_settings",
+    "GatewayDiscovery": ".gateway_discovery",
+    "GatewayDiscoveryAudit": ".gateway_discovery",
+    "GatewayAudit": ".gateway_discovery",
     "InstalledApps": ".installed_apps",
     "InstalledAppsAudit": ".installed_apps",
     "PasswordPolicy": ".password_policy",

@@ -14,7 +14,9 @@ _AUDIT_SPECS = {
     "com": (".system_settings", "SystemSettings", "System Settings Audit"),
     "end": (".endpoint_security", "SecurityAudit", "Endpoint Security Audit"),
     "rem": (".remote_access", "RemoteAccessSettings", "Remote Access Settings Audit"),
+    "smb": (".shared_folders", "SharedFolders", "Shared Folders Audit"),
     "net": (".network_settings", "NetworkSettings", "Network Settings Audit"),
+    "gds": (".gateway_discovery", "GatewayDiscovery", "Gateway Discovery Audit"),
     "app": (".installed_apps", "InstalledApps", "Installed Applications Audit"),
     "dsa": (".domain_settings", "DomainAudit", "Domain Settings Audit"),
     "pwd": (".password_policy", "PasswordPolicy", "Password Policy Audit"),
@@ -22,7 +24,7 @@ _AUDIT_SPECS = {
     "ssl": (".ssl_interception", "SSLInterception", "SSL Interception Audit"),
 }
 
-_ALL_ORDER = ("com", "end", "rem", "net", "app", "dsa", "pwd", "prx", "ssl")
+_ALL_ORDER = ("com", "end", "rem", "smb", "net", "gds", "app", "dsa", "pwd", "prx", "ssl")
 
 
 class FullAudit:
@@ -88,12 +90,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit remote access settings",
     )
     group.add_argument(
+        "-smb",
+        "--shares",
+        dest="audit",
+        action="store_const",
+        const="smb",
+        help="Audit shared folders and network exports",
+    )
+    group.add_argument(
         "-net",
         "--network",
         dest="audit",
         action="store_const",
         const="net",
         help="Audit network settings",
+    )
+    group.add_argument(
+        "-gds",
+        "--gateway",
+        dest="audit",
+        action="store_const",
+        const="gds",
+        help="Audit default gateway and network edge exposure",
     )
     group.add_argument(
         "-app",
@@ -183,6 +201,10 @@ _SECTION_DIVIDER_KEYS = {
     "File Sharing (SMB)",
     "PKU2U Authentication",
     "Bluetooth",
+    "shares",
+    "gateway",
+    "exposure",
+    "connectivity",
 }
 
 _LABEL_REPLACEMENTS = {
@@ -238,6 +260,11 @@ _LABEL_REPLACEMENTS = {
     "vnc": "VNC",
     "nfs": "NFS",
     "cups": "CUPS",
+    "ipv6": "IPv6",
+    "cidr": "CIDR",
+    "mtu": "MTU",
+    "nat": "NAT",
+    "vpn": "VPN",
 }
 
 
@@ -321,7 +348,7 @@ def _print_value(value, indent: int = 0, parent_key: str | None = None) -> None:
             print(f"{prefix}(none)")
             return
         for idx, item in enumerate(value):
-            if idx > 0 and parent_key == "adapters":
+            if idx > 0 and parent_key in ("adapters", "shares"):
                 print("–" * 50)
             if isinstance(item, dict):
                 if not item:
