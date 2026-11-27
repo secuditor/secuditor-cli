@@ -14,7 +14,7 @@ pip install secuditor
 
 Run a single audit module or `-all` / `--audit` to run the full suite:
 
-| Short | Long | Description |
+| Short&nbsp;Flag | Long&nbsp;Flag&nbsp;Alias | Description |
 | --- | --- | --- |
 | `-com` | `--system` | System specifications, firmware, memory, GPU, and connected hardware |
 | `-end` | `--endpoint` | Endpoint security settings (Defender, firewall, BitLocker/LUKS/FileVault, UAC, MAC, etc.) |
@@ -33,11 +33,12 @@ Run a single audit module or `-all` / `--audit` to run the full suite:
 
 ### Options
 
-| Flag | Description |
+| Option&nbsp;/&nbsp;Argument | Description |
 | --- | --- |
 | `--json` | Output results as structured JSON to stdout (or to the file given by `-o`) |
-| `-o PATH`, `--output PATH` | Write plain-text or JSON output to a UTF-8 file instead of stdout (creates missing parent directories) |
+| `-o PATH` / `--output PATH` | Write plain-text or JSON output to a UTF-8 file instead of stdout (creates missing parent directories) |
 | `--version` | Show the installed `secuditor` version and exit |
+| `-h` / `--help` | Show CLI usage help, available audit flags, and options, then exit |
 
 - Plain-text `secuditor -all` prints each audit section followed by a **Summary Report** table with Pass / Fail / N/A counts and MITRE ATT&CK references.
 - JSON `secuditor -all --json` outputs a single JSON object containing all 13 audit module results keyed by module name.
@@ -49,9 +50,13 @@ secuditor -all
 secuditor -all -o report.txt
 secuditor -all --json
 secuditor -all --json -o report.json
-secuditor -end --json
+
+secuditor -smb
+secuditor -end
 secuditor -prc
+
 secuditor --version
+secuditor --help
 ```
 
 ## Python Library Usage
