@@ -4,19 +4,25 @@
 
 import argparse
 from collections.abc import Sequence
+import contextlib
 from importlib import import_module
+import io
 import json
+import os
 import sys
 
 from . import __version__
+from .summary_report import build_summary_report, format_summary_report
 
 _AUDIT_SPECS = {
     "com": (".system_settings", "SystemSettings", "System Settings Audit"),
     "end": (".endpoint_security", "SecurityAudit", "Endpoint Security Audit"),
     "rem": (".remote_access", "RemoteAccessSettings", "Remote Access Settings Audit"),
     "smb": (".shared_folders", "SharedFolders", "Shared Folders Audit"),
+    "pth": (".sensitive_paths", "SensitivePaths", "Sensitive Paths Audit"),
+    "prc": (".suspicious_processes", "SuspiciousProcesses", "Suspicious Processes Audit"),
     "net": (".network_settings", "NetworkSettings", "Network Settings Audit"),
-    "gds": (".gateway_discovery", "GatewayDiscovery", "Gateway Discovery Audit"),
+    "dgm": (".gateway_discovery", "GatewayDiscovery", "Gateway Discovery Audit"),
     "app": (".installed_apps", "InstalledApps", "Installed Applications Audit"),
     "dsa": (".domain_settings", "DomainAudit", "Domain Settings Audit"),
     "pwd": (".password_policy", "PasswordPolicy", "Password Policy Audit"),
@@ -24,24 +30,24 @@ _AUDIT_SPECS = {
     "ssl": (".ssl_interception", "SSLInterception", "SSL Interception Audit"),
 }
 
-_ALL_ORDER = ("com", "end", "rem", "smb", "net", "gds", "app", "dsa", "pwd", "prx", "ssl")
+_ALL_ORDER = ("com", "end", "rem", "smb", "pth", "prc", "net", "dgm", "app", "dsa", "pwd", "prx", "ssl")
 
 
 class FullAudit:
     """Run all Secuditor audit modules in the standard execution order."""
 
     def audit(self) -> dict:
-        results = {}
+        section_results = {}
         for key in _ALL_ORDER:
             module_name, class_name, _ = _AUDIT_SPECS[key]
             section_key = module_name.lstrip(".")
             try:
                 module = import_module(module_name, package=__package__)
                 audit_class = getattr(module, class_name)
-                results[section_key] = audit_class().audit()
+                section_results[section_key] = audit_class().audit()
             except Exception as exc:
-                results[section_key] = {"error": str(exc)}
-        return results
+                section_results[section_key] = {"error": str(exc)}
+        return section_results
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +68,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Output results as JSON",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="PATH",
+        help="Write output to a UTF-8 file instead of stdout",
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
@@ -98,6 +111,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit shared folders and network exports",
     )
     group.add_argument(
+        "-pth",
+        "--paths",
+        dest="audit",
+        action="store_const",
+        const="pth",
+        help="Audit sensitive files and permission exposure",
+    )
+    group.add_argument(
+        "-prc",
+        "--processes",
+        dest="audit",
+        action="store_const",
+        const="prc",
+        help="Audit running processes for suspicious activity",
+    )
+    group.add_argument(
         "-net",
         "--network",
         dest="audit",
@@ -106,11 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit network settings",
     )
     group.add_argument(
-        "-gds",
+        "-dgm",
         "--gateway",
         dest="audit",
         action="store_const",
-        const="gds",
+        const="dgm",
         help="Audit default gateway and network edge exposure",
     )
     group.add_argument(
@@ -147,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group.add_argument(
         "-ssl",
-        "--ssl",
+        "--intercep",
         dest="audit",
         action="store_const",
         const="ssl",
@@ -155,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group.add_argument(
         "-all",
-        "--all",
+        "--audit",
         dest="audit",
         action="store_const",
         const="all",
@@ -202,6 +231,8 @@ _SECTION_DIVIDER_KEYS = {
     "PKU2U Authentication",
     "Bluetooth",
     "shares",
+    "summary",
+    "findings",
     "gateway",
     "exposure",
     "connectivity",
@@ -265,6 +296,7 @@ _LABEL_REPLACEMENTS = {
     "mtu": "MTU",
     "nat": "NAT",
     "vpn": "VPN",
+    "acl": "ACL",
 }
 
 
@@ -373,7 +405,12 @@ def _print_value(value, indent: int = 0, parent_key: str | None = None) -> None:
         print(f"{prefix}{value}")
 
 
-def print_results(title: str, results, as_json: bool = False) -> None:
+def print_results(
+    title: str,
+    results,
+    as_json: bool = False,
+    formatter=None,
+) -> None:
     """Print audit results in text or JSON format."""
     if as_json:
         print(json.dumps(results, indent=2, default=str, ensure_ascii=False))
@@ -381,7 +418,70 @@ def print_results(title: str, results, as_json: bool = False) -> None:
 
     print(f"\nSecuditor {title}")
     print("=" * 50)
-    _print_value(results)
+    if (
+        callable(formatter)
+        and isinstance(results, dict)
+        and "error" not in results
+    ):
+        print(formatter(results))
+    else:
+        _print_value(results)
+
+
+def _prepare_output_path(raw_path: str) -> str:
+    """Validate and resolve a file output path before running an audit."""
+    if not raw_path or not raw_path.strip():
+        raise ValueError("Output path cannot be empty.")
+    trailing_sep = raw_path.endswith(os.sep) or (
+        bool(os.altsep) and raw_path.endswith(os.altsep)
+    )
+    resolved = os.path.abspath(os.path.expanduser(raw_path))
+    if trailing_sep or os.path.isdir(resolved):
+        raise IsADirectoryError(f"Output path is a directory: {resolved}")
+    parent = os.path.dirname(resolved)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return resolved
+
+
+def _run_audit(args: argparse.Namespace) -> None:
+    """Execute the selected audit and print results to sys.stdout."""
+    if args.audit == "all":
+        if args.json:
+            print(
+                json.dumps(
+                    FullAudit().audit(),
+                    indent=2,
+                    default=str,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            collected = {}
+            for key in _ALL_ORDER:
+                module_name, class_name, title = _AUDIT_SPECS[key]
+                section_key = module_name.lstrip(".")
+                formatter = None
+                try:
+                    module = import_module(module_name, package=__package__)
+                    audit_class = getattr(module, class_name)
+                    formatter = getattr(audit_class, "format_report", None)
+                    results = audit_class().audit()
+                except Exception as exc:
+                    results = {"error": str(exc)}
+                collected[section_key] = results
+                print_results(
+                    title, results, as_json=False, formatter=formatter
+                )
+            print(format_summary_report(build_summary_report(collected)))
+        return
+
+    module_name, class_name, title = _AUDIT_SPECS[args.audit]
+    module = import_module(module_name, package=__package__)
+    audit_class = getattr(module, class_name)
+    formatter = getattr(audit_class, "format_report", None)
+    results = audit_class().audit()
+    print_results(title, results, args.json, formatter=formatter)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -390,33 +490,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.audit == "all":
-            if args.json:
-                print(
-                    json.dumps(
-                        FullAudit().audit(),
-                        indent=2,
-                        default=str,
-                        ensure_ascii=False,
-                    )
-                )
-            else:
-                for key in _ALL_ORDER:
-                    module_name, class_name, title = _AUDIT_SPECS[key]
-                    try:
-                        module = import_module(module_name, package=__package__)
-                        audit_class = getattr(module, class_name)
-                        results = audit_class().audit()
-                    except Exception as exc:
-                        results = {"error": str(exc)}
-                    print_results(title, results, as_json=False)
-            return 0
-
-        module_name, class_name, title = _AUDIT_SPECS[args.audit]
-        module = import_module(module_name, package=__package__)
-        audit_class = getattr(module, class_name)
-        results = audit_class().audit()
-        print_results(title, results, args.json)
+        if args.output is not None:
+            output_path = _prepare_output_path(args.output)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                _run_audit(args)
+            with open(output_path, "w", encoding="utf-8") as fh:
+                fh.write(buffer.getvalue())
+            print(f"Report saved to: {output_path}")
+        else:
+            _run_audit(args)
         return 0
 
     except KeyboardInterrupt:

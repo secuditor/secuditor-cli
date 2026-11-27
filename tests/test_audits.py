@@ -22,7 +22,9 @@ from secuditor import (
     RemoteAccessSettings,
     SSLInterception,
     SecurityAudit,
+    SensitivePaths,
     SharedFolders,
+    SuspiciousProcesses,
     SuspiciousProxy,
     SystemSettings,
 )
@@ -1126,6 +1128,340 @@ class TestGatewayDiscoveryAudit(unittest.TestCase):
         self.assertEqual(report["exposure"]["management_ports"], "HTTPS (443)")
         self.assertEqual(report["connectivity"]["nat"], "Detected")
         self.assertEqual(report["connectivity"]["public_ip"], "93.184.216.34")
+
+
+class TestSensitivePathsAudit(unittest.TestCase):
+    def test_classify_posix_permissions_and_rdp_inspection(self):
+        import tempfile
+
+        audit = SensitivePaths()
+        audit.system = "Linux"
+
+        with patch("os.lstat", return_value=types.SimpleNamespace(st_mode=0o100644)):
+            lvl, lbl = audit.inspect_acl("/home/alice/.ssh/id_rsa")
+            self.assertEqual(lvl, "exposed")
+            self.assertIn("World-readable", lbl)
+            risk, cat, _ = audit._classify_file("/home/alice/.ssh/id_rsa", lvl, lbl)
+            self.assertEqual((risk, cat), ("High", "Credentials & Keys"))
+
+        with patch("os.lstat", return_value=types.SimpleNamespace(st_mode=0o100640)):
+            lvl, lbl = audit.inspect_acl("/home/alice/.aws/credentials")
+            self.assertEqual(lvl, "shared")
+            self.assertIn("Group-accessible", lbl)
+
+        with patch("os.lstat", return_value=types.SimpleNamespace(st_mode=0o100600)):
+            lvl, lbl = audit.inspect_acl("/home/alice/.env")
+            self.assertEqual(lvl, "private")
+            risk, cat, _ = audit._classify_file("/home/alice/.env", lvl, lbl)
+            self.assertEqual((risk, cat), ("Medium", "Config & Secret"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            default_rdp = os.path.join(tmpdir, "Default.rdp")
+            with open(default_rdp, "w", encoding="utf-8") as f:
+                f.write("screen mode id:i:2\n")
+            self.assertTrue(audit._inspect_rdp_file(default_rdp)["skip"])
+
+            saved_rdp = os.path.join(tmpdir, "server.rdp")
+            with open(saved_rdp, "w", encoding="utf-8") as f:
+                f.write("full address:s:10.0.0.5\npassword 51:b:01000000\n")
+            info = audit._inspect_rdp_file(saved_rdp)
+            self.assertFalse(info["skip"])
+            self.assertTrue(info["has_password"])
+            self.assertEqual(info["note"], "Saved password")
+
+    def test_search_for_copies_skips_dev_dirs_benign_files_and_ranks_findings(self):
+        import tempfile
+
+        audit = SensitivePaths()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "node_modules"))
+            with open(os.path.join(tmpdir, "node_modules", "ignored.env"), "w", encoding="utf-8") as f:
+                f.write("SECRET=1\n")
+            with open(os.path.join(tmpdir, "thumbs.db"), "w", encoding="utf-8") as f:
+                f.write("benign\n")
+            env_path = os.path.join(tmpdir, "app.env")
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write("KEY=1\n")
+            rdp_path = os.path.join(tmpdir, "prod.rdp")
+            with open(rdp_path, "w", encoding="utf-8") as f:
+                f.write("full address:s:10.0.0.10\npassword 51:b:deadbeef\n")
+
+            with (
+                patch.object(audit, "check_sensitive_targets", return_value=[]),
+                patch.object(audit, "inspect_acl", return_value=("private", "Private")),
+            ):
+                report = audit.audit(check_dirs=[tmpdir])
+
+        self.assertEqual(report["summary"]["total_count"], 2)
+        self.assertEqual(report["summary"]["high"], 1)
+        self.assertEqual(report["summary"]["medium"], 1)
+        self.assertEqual(report["findings"][0]["target"], rdp_path)
+        self.assertEqual(report["findings"][0]["risk"], "High")
+        self.assertEqual(report["findings"][1]["target"], env_path)
+        self.assertEqual(report["findings"][1]["risk"], "Medium")
+
+    def test_temp_db_noise_and_ephemeral_test_dirs_filtered(self):
+        import tempfile
+
+        audit = SensitivePaths()
+        with tempfile.TemporaryDirectory() as root:
+            temp_root = os.path.join(root, "Temp")
+            os.makedirs(os.path.join(temp_root, "pytest-of-User", "pytest-1"))
+            os.makedirs(os.path.join(temp_root, "tmp__zz6avo"))
+            os.makedirs(os.path.join(temp_root, "AppCache"))
+
+            # Ephemeral test dirs should be skipped completely
+            with open(os.path.join(temp_root, "pytest-of-User", "pytest-1", "a.db"), "w") as f:
+                f.write("x")
+            with open(os.path.join(temp_root, "tmp__zz6avo", "b.db"), "w") as f:
+                f.write("x")
+            # Private .db in Temp should be skipped; Exposed .db in Temp MUST be kept
+            priv_db = os.path.join(temp_root, "AppCache", "cache.db")
+            exp_db = os.path.join(temp_root, "AppCache", "exposed.db")
+            env_file = os.path.join(temp_root, "AppCache", "leaked.env")
+            for p in (priv_db, exp_db, env_file):
+                with open(p, "w") as f:
+                    f.write("x")
+
+            def fake_acl(path):
+                if os.path.basename(path) == "exposed.db":
+                    return "exposed", "Exposed: Everyone"
+                return "private", "Private"
+
+            with (
+                patch.object(audit, "check_sensitive_targets", return_value=[]),
+                patch.object(audit, "inspect_acl", side_effect=fake_acl),
+            ):
+                report = audit.audit(check_dirs=[temp_root])
+
+        targets = [f["target"] for f in report["findings"]]
+        self.assertEqual(len(targets), 2)
+        self.assertIn(exp_db, targets)
+        self.assertIn(env_file, targets)
+        self.assertNotIn(priv_db, targets)
+
+
+class TestSuspiciousProcessesAudit(unittest.TestCase):
+    def test_windows_risk_threshold_60_and_tree_card_format(self):
+        audit = SuspiciousProcesses()
+        audit.system = "Windows"
+
+        class FakeProc:
+            def __init__(self, pid, name, cmdline, exe_path, parent_name=None):
+                self.pid = pid
+                self.info = {"pid": pid, "name": name, "cmdline": cmdline}
+                self._exe = exe_path
+                self._parent_name = parent_name
+
+            def exe(self):
+                return self._exe
+
+            def parent(self):
+                if not self._parent_name:
+                    return None
+                return types.SimpleNamespace(
+                    name=lambda: self._parent_name,
+                    create_time=lambda: 100.0,
+                )
+
+            def create_time(self):
+                return 200.0
+
+            def children(self):
+                return []
+
+            def memory_maps(self):
+                return []
+
+        bad_proc = FakeProc(
+            pid=4321,
+            name="svch0st.exe",
+            cmdline=["svch0st.exe", "-enc", "SQBFAFgA"],
+            exe_path=r"C:\Users\alice\Downloads\svch0st.exe",
+        )
+        benign_proc = FakeProc(
+            pid=1000,
+            name="notepad.exe",
+            cmdline=["notepad.exe"],
+            exe_path=r"C:\Windows\System32\notepad.exe",
+        )
+
+        with (
+            patch("psutil.process_iter", return_value=[bad_proc, benign_proc]),
+            patch("psutil.net_connections", return_value=[]),
+            patch.object(
+                audit,
+                "_preload_windows_persistence",
+                return_value=(set(), set(), set(), set(), set()),
+            ),
+            patch.object(
+                audit,
+                "_windows_file_attrs_and_drive",
+                return_value=(False, False, "C:", False),
+            ),
+            patch.object(audit, "_windows_motw_zone", return_value="3"),
+            patch.object(
+                audit,
+                "_batch_verify_signatures",
+                return_value={
+                    os.path.normcase(r"C:\Users\alice\Downloads\svch0st.exe"): (
+                        "NotSigned",
+                        "",
+                    )
+                },
+            ),
+            patch.object(audit, "_is_process_elevated", return_value=False),
+            patch.object(audit, "_file_entropy", return_value=None),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["threshold"], 60)
+        self.assertEqual(report["summary"]["flagged_count"], 1)
+        self.assertEqual(report["summary"]["high"], 1)
+        finding = report["findings"][0]
+        self.assertEqual(finding["name"], "svch0st.exe")
+        self.assertGreaterEqual(finding["risk"], 90)
+        self.assertEqual(finding["risk_tier"], "High")
+
+        rendered = SuspiciousProcesses.format_report(report)
+        self.assertIn("Suspicious Processes Detected: 1  (High: 1)", rendered)
+        self.assertIn(f"[ High | Risk {finding['risk']} ] svch0st.exe (PID: 4321)", rendered)
+        self.assertIn("Path: C:\\Users\\alice\\Downloads\\svch0st.exe", rendered)
+        self.assertIn("Findings:", rendered)
+
+    def test_linux_deleted_root_binary_in_tmp_flagged_and_clean_format(self):
+        audit = SuspiciousProcesses()
+        audit.system = "Linux"
+
+        class FakeLinuxProc:
+            def __init__(self):
+                self.pid = 7777
+                self.info = {
+                    "pid": 7777,
+                    "name": "payload",
+                    "cmdline": ["/tmp/payload", "bash", "-i"],
+                }
+
+            def exe(self):
+                return "/tmp/payload (deleted)"
+
+            def parent(self):
+                return types.SimpleNamespace(name=lambda: "nginx")
+
+            def children(self):
+                return []
+
+            def memory_maps(self):
+                return []
+
+            def uids(self):
+                return types.SimpleNamespace(effective=0)
+
+        with (
+            patch("psutil.process_iter", return_value=[FakeLinuxProc()]),
+            patch("psutil.net_connections", return_value=[]),
+            patch.object(audit, "_preload_posix_persistence", return_value=set()),
+            patch.object(audit, "_file_entropy", return_value=None),
+        ):
+            report = audit.audit()
+
+        self.assertEqual(report["summary"]["flagged_count"], 1)
+        finding = report["findings"][0]
+        self.assertEqual(finding["name"], "payload")
+        self.assertGreaterEqual(finding["risk"], 60)
+        self.assertIn("Deleted executable on disk", finding["reasons"])
+        self.assertIn("Root process running from suspicious location", finding["reasons"])
+
+        self.assertEqual(
+            SuspiciousProcesses.format_report({"findings": []}),
+            "No suspicious activity detected",
+        )
+
+
+class TestSummaryReport(unittest.TestCase):
+    def test_build_and_format_summary_report_windows_and_linux(self):
+        from datetime import datetime
+        from secuditor.summary_report import (
+            build_summary_report,
+            format_summary_report,
+        )
+
+        win_results = {
+            "system_settings": {"system": {"hostname": "CORE-DEV64", "platform": "Windows"}},
+            "endpoint_security": {
+                "platform": "Windows",
+                "hostname": "CORE-DEV64",
+                "checks": {
+                    "Windows Defender": ["Windows Defender (Inactive)"],
+                    "Endpoint Protection": ["AVG Antivirus (Active)"],
+                    "Host-based Firewall": "AVG Antivirus (On)",
+                    "Auto Screen Lock": "Default (Sleep lock enabled)",
+                    "UAC Elevation": "Prompt for consent (Non-Windows binaries)",
+                    "Core Isolation": "Enabled",
+                    "UEFI Secure Boot": "Enabled",
+                    "System Restore": "Disabled",
+                    "BitLocker Drive Encryption": "Disabled",
+                },
+            },
+            "gateway_discovery": {
+                "gateway": {"ip": "192.168.1.1", "vendor": "Fortinet (Firewall)"},
+                "exposure": {"management_ports": "HTTPS (443)"},
+            },
+            "domain_settings": {
+                "platform": "Windows",
+                "affiliation": {"status": "detected", "value": {"type": "workgroup or standalone", "name": "WORKGROUP"}},
+                "laps": {"status": "unknown", "value": None},
+                "ntlm_policy": {"status": "detected", "value": {"verdict": "Moderate, NTLMv2 is used but not enforced"}},
+            },
+            "password_policy": {
+                "settings": {
+                    "minimum_length": {"value": 0, "status": "detected"},
+                    "password_required": {"value": False, "status": "detected"},
+                    "lockout_threshold": {"value": 10, "status": "detected"},
+                }
+            },
+            "remote_access": {
+                "platform": "Windows",
+                "checks": {
+                    "Bluetooth": "Disabled (Hardware disabled)",
+                    "PowerShell Remoting": "Disabled",
+                    "RPC Print Spooler": "Enabled, Low Risk (Restricted access)",
+                    "SMB1": "Disabled",
+                    "SMB2": "Enabled, Moderate Risk (Signing/Encryption not required)",
+                    "FTP Service": "Not Detected",
+                    "DCOM": "Enabled, Hardened by Patch",
+                    "WinRM": "Enabled, Low Risk (No port listeners)",
+                    "Remote Desktop": "Disabled",
+                },
+            },
+            "shared_folders": {"count": 2, "exposed_count": 1},
+            "sensitive_paths": {"summary": {"total_count": 2, "high": 0, "medium": 0, "low": 2}},
+            "suspicious_proxy": {"analysis": {"verdict": "Not Detected"}},
+            "ssl_interception": {"verdict": "Not Detected"},
+            "suspicious_processes": {"summary": {"flagged_count": 1}},
+        }
+
+        summary = build_summary_report(
+            win_results, timestamp=datetime(2026, 11, 27, 10, 35, 41)
+        )
+        self.assertEqual(summary["hostname"], "CORE-DEV64")
+        self.assertEqual(summary["counts"]["fail"], 6)
+        self.assertGreater(summary["counts"]["pass"], 15)
+
+        by_elem = {r["element"]: r for r in summary["rows"]}
+        self.assertEqual(by_elem["Endpoint Protection"]["result"], "Pass")
+        self.assertEqual(by_elem["System Restore"]["result"], "Fail")
+        self.assertIn("T1490", by_elem["System Restore"]["mitre"])
+        self.assertEqual(by_elem["Shared Folders"]["result"], "Fail")
+        self.assertEqual(by_elem["Suspicious Activity"]["result"], "Fail")
+        self.assertIn("T1055", by_elem["Suspicious Activity"]["mitre"])
+
+        table = format_summary_report(summary)
+        self.assertIn("Summary Report", table)
+        self.assertIn("CORE-DEV64", table)
+        self.assertIn("2026-11-27 10:35:41", table)
+        self.assertIn("MITRE ATT&CK", table)
+        self.assertIn("T1055 (Process Anomaly)", table)
 
 
 if __name__ == "__main__":

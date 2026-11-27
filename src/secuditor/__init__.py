@@ -4,7 +4,7 @@
 
 from importlib import import_module
 
-__version__ = "0.9.0"
+__version__ = "1.0.0"
 __author__ = "Menahem Levinski"
 __license__ = "MIT"
 
@@ -16,6 +16,8 @@ __all__ = [
     "SecurityAudit",
     "RemoteAccessSettings",
     "SharedFolders",
+    "SensitivePaths",
+    "SuspiciousProcesses",
     "NetworkSettings",
     "GatewayDiscovery",
     "InstalledApps",
@@ -36,6 +38,10 @@ _MODULES = {
     "RemoteAccessAudit": ".remote_access",
     "SharedFolders": ".shared_folders",
     "SharedFoldersAudit": ".shared_folders",
+    "SensitivePaths": ".sensitive_paths",
+    "SensitivePathsAudit": ".sensitive_paths",
+    "SuspiciousProcesses": ".suspicious_processes",
+    "SuspiciousProcessesAudit": ".suspicious_processes",
     "NetworkSettings": ".network_settings",
     "NetworkSettingsAudit": ".network_settings",
     "GatewayDiscovery": ".gateway_discovery",

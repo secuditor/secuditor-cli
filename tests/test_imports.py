@@ -11,7 +11,9 @@ from secuditor import (
     RemoteAccessSettings,
     SSLInterception,
     SecurityAudit,
+    SensitivePaths,
     SharedFolders,
+    SuspiciousProcesses,
     SuspiciousProxy,
     SystemSettings,
     __version__,
@@ -20,7 +22,7 @@ from secuditor import (
 
 class TestPackageImports(unittest.TestCase):
     def test_package_version(self):
-        self.assertEqual(__version__, "0.8.0")
+        self.assertEqual(__version__, "1.0.0")
 
     def test_public_classes_are_importable(self):
         classes = [
@@ -28,6 +30,8 @@ class TestPackageImports(unittest.TestCase):
             SecurityAudit,
             RemoteAccessSettings,
             SharedFolders,
+            SensitivePaths,
+            SuspiciousProcesses,
             NetworkSettings,
             GatewayDiscovery,
             InstalledApps,

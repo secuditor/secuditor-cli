@@ -38,7 +38,7 @@ You can help in many ways:
 
 * Bug fixes
 * Performance improvements
-* Cross-platform compatibility enhancements (Windows & Linux/macOS)
+* Cross-platform compatibility enhancements (Windows, Linux, and macOS)
 * Refactoring for readability and maintainability
 * Adding safe, passive diagnostic checks
 
@@ -71,7 +71,7 @@ To keep the project clean and consistent, please follow these rules:
 * Python version: **Python 3.10 or later** (`requires-python = ">=3.10"`)
 * Keep dependencies minimal (`psutil`, `cryptography`, `certifi`, plus the Python standard library)
 * Keep all audits **strictly read-only** — do not mutate system, registry, or policy configuration
-* Preserve safe subprocess execution (`shell=False`, explicit timeouts, System32 path resolution on Windows via `_utils.py`) and proper Win32 `ctypes` buffer cleanup (`NetApiBufferFree`)
+* Preserve safe subprocess execution (`shell=False`, explicit timeouts, System32 path resolution on Windows via `_utils.py`) and proper Win32 `ctypes` buffer cleanup (`NetApiBufferFree`, `LocalFree`)
 * Guard platform-specific imports and behavior cleanly (e.g., `winreg`, `pwd`/`grp`, `ctypes.windll`) so imports work on Windows, Linux, and macOS
 * Write clear, readable, and well-commented code following PEP 8 where reasonable
 * Keep unit tests offline and deterministic using mocks (no live system mutations or external network calls in `tests/`)
