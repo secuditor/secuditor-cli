@@ -15,6 +15,7 @@ from ._utils import (
     find_powershell,
     read_registry_value,
     run_command,
+    run_command_result,
     run_powershell,
 )
 
@@ -61,6 +62,9 @@ class SecuritySettingsAudit:
 
     def _run(self, command):
         return run_command(command, timeout=self.timeout)
+
+    def _run_result(self, command):
+        return run_command_result(command, timeout=self.timeout)
 
     def _windows_ps_bundle(self):
         """Run a single batched PowerShell query for Windows endpoint security signals."""
@@ -915,24 +919,111 @@ class SecuritySettingsAudit:
                     result["Host-based Firewall"] = "UFW (On)"
                 elif "status: inactive" in lower:
                     result["Host-based Firewall"] = "UFW (Off)"
-        if result["Host-based Firewall"] == "Unknown" and shutil.which("firewall-cmd"):
-            out = self._run(["firewall-cmd", "--state"])
-            if out:
-                result["Host-based Firewall"] = (
-                    "firewalld (On)"
-                    if out.strip().lower() == "running"
-                    else f"firewalld ({out.strip()})"
-                )
-        if result["Host-based Firewall"] == "Unknown" and shutil.which("systemctl"):
+        if (
+            result["Host-based Firewall"] == "Unknown"
+            and os.path.isfile("/etc/ufw/ufw.conf")
+        ):
+            try:
+                with open(
+                    "/etc/ufw/ufw.conf", encoding="utf-8", errors="replace"
+                ) as f:
+                    for line in f:
+                        cleaned = line.split("#", 1)[0].strip().lower()
+                        if cleaned.startswith("enabled="):
+                            val = cleaned.split("=", 1)[1].strip().strip("\"'")
+                            if val == "yes":
+                                result["Host-based Firewall"] = "UFW (On)"
+                            elif val == "no":
+                                result["Host-based Firewall"] = "UFW (Off)"
+                            break
+            except OSError:
+                pass
+        if (
+            result["Host-based Firewall"] == "Unknown"
+            and shutil.which("firewall-cmd")
+        ):
+            res = self._run_result(["firewall-cmd", "--state"])
+            if res is not None:
+                rc, stdout, stderr = res
+                combined = f"{stdout}\n{stderr}".strip().lower()
+                if rc == 0 and "running" in combined and "not running" not in combined:
+                    result["Host-based Firewall"] = "firewalld (On)"
+                elif "not running" in combined:
+                    result["Host-based Firewall"] = "firewalld (Off)"
+        if (
+            result["Host-based Firewall"] == "Unknown"
+            and shutil.which("systemctl")
+        ):
+            installed_inactive = None
+            systemd_reachable = False
             for svc, label in (
                 ("ufw", "UFW"),
                 ("firewalld", "firewalld"),
                 ("nftables", "nftables"),
+                ("netfilter-persistent", "iptables"),
+                ("iptables", "iptables"),
             ):
-                state = self._run(["systemctl", "is-active", svc])
-                if state and state.strip().lower() == "active":
-                    result["Host-based Firewall"] = f"{label} (On)"
-                    break
+                props = self._run([
+                    "systemctl",
+                    "show",
+                    "-p",
+                    "LoadState",
+                    "-p",
+                    "ActiveState",
+                    svc,
+                ])
+                if props:
+                    systemd_reachable = True
+                    kv = {}
+                    for line in props.splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            kv[k.strip()] = v.strip().lower()
+                    active_state = kv.get("ActiveState", "")
+                    load_state = kv.get("LoadState", "")
+                    if active_state == "active":
+                        result["Host-based Firewall"] = f"{label} (On)"
+                        break
+                    if (
+                        load_state == "loaded"
+                        and active_state in ("inactive", "failed", "dead")
+                        and installed_inactive is None
+                    ):
+                        installed_inactive = label
+                else:
+                    state = self._run(["systemctl", "is-active", svc])
+                    if state and state.strip().lower() == "active":
+                        result["Host-based Firewall"] = f"{label} (On)"
+                        break
+
+            if result["Host-based Firewall"] == "Unknown":
+                is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+                if is_root and shutil.which("nft"):
+                    nft_out = self._run(["nft", "list", "ruleset"])
+                    if nft_out and "chain " in nft_out:
+                        result["Host-based Firewall"] = "nftables (On)"
+                if (
+                    result["Host-based Firewall"] == "Unknown"
+                    and is_root
+                    and shutil.which("iptables")
+                ):
+                    ipt_out = self._run(["iptables", "-S"])
+                    if ipt_out:
+                        has_rules = any(
+                            ln.strip().startswith(
+                                ("-A ", "-P INPUT DROP", "-P INPUT REJECT")
+                            )
+                            for ln in ipt_out.splitlines()
+                        )
+                        if has_rules:
+                            result["Host-based Firewall"] = "iptables (On)"
+                if result["Host-based Firewall"] == "Unknown":
+                    if installed_inactive:
+                        result["Host-based Firewall"] = (
+                            f"{installed_inactive} (Off)"
+                        )
+                    elif systemd_reachable or is_root:
+                        result["Host-based Firewall"] = "Not Detected (Off)"
 
         # 4. Auto Screen Lock
         if shutil.which("gsettings"):
@@ -1003,6 +1094,19 @@ class SecuritySettingsAudit:
                         result["UEFI Secure Boot"] = "Enabled"
                     elif "disabled" in lower:
                         result["UEFI Secure Boot"] = "Disabled"
+            if result["UEFI Secure Boot"] == "Unknown" and shutil.which("bootctl"):
+                res = self._run_result(["bootctl", "status"])
+                if res is not None:
+                    _, stdout, _ = res
+                    for line in stdout.splitlines():
+                        low = line.strip().lower()
+                        if low.startswith("secure boot:"):
+                            val = low.split(":", 1)[1].strip()
+                            if val.startswith("enabled"):
+                                result["UEFI Secure Boot"] = "Enabled"
+                            elif val.startswith("disabled"):
+                                result["UEFI Secure Boot"] = "Disabled"
+                            break
 
         # 8. Removable Storage
         usb_disabled = False

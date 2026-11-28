@@ -1,3 +1,5 @@
+from pathlib import Path
+import re
 import unittest
 
 import secuditor
@@ -22,7 +24,14 @@ from secuditor import (
 
 class TestPackageImports(unittest.TestCase):
     def test_package_version(self):
-        self.assertEqual(__version__, "1.0.0")
+        pyproject_text = (
+            Path(__file__).resolve().parent.parent / "pyproject.toml"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r'^version\s*=\s*"([^"]+)"', pyproject_text, re.MULTILINE
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(__version__, match.group(1))
 
     def test_public_classes_are_importable(self):
         classes = [

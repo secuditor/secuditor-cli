@@ -3,6 +3,7 @@
 """Cross-platform local password policy discovery."""
 
 from datetime import datetime, timezone
+import glob
 import os
 import platform
 import plistlib
@@ -707,6 +708,8 @@ class PasswordPolicyAudit:
         complexity_options = []
         faillock_options = {}
         bio_modules = []
+        pam_minlen = None
+        pam_unix_minlen = None
 
         for path in pam_files:
             try:
@@ -724,13 +727,20 @@ class PasswordPolicyAudit:
                     continue
 
                 if re.search(
-                    r"\bpam_(pwquality|passwdqc)\.so\b",
+                    r"\bpam_(pwquality|passwdqc|cracklib)\.so\b",
                     line,
                 ):
                     complexity_options.append({
                         "file": path,
                         "configuration": line,
                     })
+                    ml = re.search(r"\bminlen\s*=\s*(\d+)", line)
+                    if ml:
+                        pam_minlen = int(ml.group(1))
+                elif re.search(r"\bpam_unix\.so\b", line):
+                    ml = re.search(r"\bminlen\s*=\s*(\d+)", line)
+                    if ml:
+                        pam_unix_minlen = int(ml.group(1))
 
                 if re.search(r"\bpam_faillock\.so\b", line):
                     for opt in ("deny", "unlock_time", "fail_interval"):
@@ -752,27 +762,41 @@ class PasswordPolicyAudit:
                 "Not Configured", "detected"
             )
 
-        # Read /etc/security/pwquality.conf for minlen and credit settings.
+        # Read /etc/security/pwquality.conf and drop-ins for minlen/credits.
         pwquality_cfg = {}
+        pwq_paths = ["/etc/security/pwquality.conf"]
         try:
-            with open(
-                "/etc/security/pwquality.conf",
-                encoding="utf-8",
-                errors="replace",
-            ) as file:
-                for line in file:
-                    line = line.split("#", 1)[0].strip()
-                    if "=" not in line:
-                        continue
-                    key, val = [part.strip() for part in line.split("=", 1)]
-                    if val.lstrip("-").isdigit():
-                        pwquality_cfg[key] = int(val)
+            pwq_paths.extend(sorted(glob.glob("/etc/security/pwquality.conf.d/*.conf")))
         except OSError:
             pass
+        for pwq_path in pwq_paths:
+            try:
+                with open(
+                    pwq_path,
+                    encoding="utf-8",
+                    errors="replace",
+                ) as file:
+                    for line in file:
+                        line = line.split("#", 1)[0].strip()
+                        if "=" not in line:
+                            continue
+                        key, val = [part.strip() for part in line.split("=", 1)]
+                        if val.lstrip("-").isdigit():
+                            pwquality_cfg[key] = int(val)
+            except OSError:
+                continue
 
         if "minlen" in pwquality_cfg:
             report["settings"]["minimum_length"] = self._setting(
                 pwquality_cfg["minlen"], "detected"
+            )
+        elif pam_minlen is not None:
+            report["settings"]["minimum_length"] = self._setting(
+                pam_minlen, "detected"
+            )
+        elif pam_unix_minlen is not None and report["settings"]["minimum_length"]["value"] is None:
+            report["settings"]["minimum_length"] = self._setting(
+                pam_unix_minlen, "detected"
             )
 
         pwquality_complexity = {
@@ -790,7 +814,7 @@ class PasswordPolicyAudit:
             )
         elif found_pam:
             report["settings"]["complexity"] = self._setting(
-                None, "unknown"
+                False, "detected"
             )
 
         # Read /etc/security/faillock.conf (overrides/supplements PAM args).

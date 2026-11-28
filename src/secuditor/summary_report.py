@@ -353,7 +353,7 @@ def build_summary_report(
             rows.append(_row("LAPS Protection", "Inactive", "Enterprise Related", "Fail"))
 
     # 11. Domain Settings
-    aff_label = "Workgroup (Local)"
+    aff_label = "Workgroup (Local)" if is_win else "Local (Standalone)"
     if dsa and "error" not in dsa:
         aff = dsa.get("affiliation") or {}
         aff_val = aff.get("value") if isinstance(aff, dict) else None
@@ -367,11 +367,23 @@ def build_summary_report(
             elif "entra" in atype_l:
                 aff_label = f"Entra ID ({aname})" if aname else "Entra ID"
                 rows.append(_row("Domain Settings", "Enforced", aff_label, "Pass"))
-            elif "active directory" in atype_l or "domain" in atype_l or "realm" in atype_l:
-                aff_label = f"Domain ({aname})" if aname else "Domain"
+            elif any(
+                tok in atype_l
+                for tok in (
+                    "active directory",
+                    "domain",
+                    "realm",
+                    "sssd",
+                    "freeipa",
+                    "directory",
+                    "ldap",
+                    "nis",
+                )
+            ):
+                aff_label = f"Domain ({aname})" if aname else (atype or "Domain")
                 rows.append(_row("Domain Settings", "Enforced", aff_label, "Pass"))
             else:
-                aff_label = "Workgroup (Local)"
+                aff_label = "Workgroup (Local)" if is_win else "Local (Standalone)"
                 rows.append(_row("Domain Settings", "Default", aff_label, "Pass"))
         else:
             rows.append(_row("Domain Settings", "Unknown", "Affiliation", "N/A"))
@@ -386,6 +398,9 @@ def build_summary_report(
         hello_raw = str((settings.get("pin_or_biometrics") or {}).get("value") or "")
         hello_active = hello_raw.lower().startswith("enabled")
         lockout_active = isinstance(lockout, int) and lockout > 0
+        comp_enabled = (comp is True) or (
+            isinstance(comp, (dict, list)) and len(comp) > 0
+        )
 
         if req is False:
             rows.append(_row("Password Policy", "Minimal", aff_label, "Fail"))
@@ -400,7 +415,10 @@ def build_summary_report(
             else:
                 rows.append(_row("Password Policy", "Minimal", aff_label, "Fail"))
         elif isinstance(min_len, int) and min_len >= 8:
-            status_lbl = "Strong" if (comp is True and lockout_active) else "Moderate"
+            status_lbl = "Strong" if (comp_enabled and lockout_active) else "Moderate"
+            rows.append(_row("Password Policy", status_lbl, aff_label, "Pass"))
+        elif comp_enabled:
+            status_lbl = "Strong" if lockout_active else "Moderate"
             rows.append(_row("Password Policy", status_lbl, aff_label, "Pass"))
         else:
             rows.append(_row("Password Policy", "Unknown", aff_label, "N/A"))

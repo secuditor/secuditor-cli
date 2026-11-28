@@ -803,6 +803,64 @@ class TestEndpointSecurityAudit(unittest.TestCase):
         self.assertEqual(checks["UEFI Secure Boot"], "Unsupported")
         self.assertEqual(checks["System Snapshots"], "Available (Timeshift)")
 
+    def test_linux_nonroot_firewall_fallbacks_and_bootctl_secure_boot(self):
+        audit = SecurityAudit()
+        audit.system = "Linux"
+
+        fake_files = {
+            "/sys/module/apparmor/parameters/enabled": "Y\n",
+            "/proc/sys/kernel/randomize_va_space": "2\n",
+        }
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            if path in fake_files:
+                return io.StringIO(fake_files[path])
+            return real_open(path, *args, **kwargs)
+
+        def fake_run(cmd):
+            if cmd[:2] == ["systemctl", "show"]:
+                svc = cmd[-1]
+                if svc == "nftables":
+                    return "LoadState=loaded\nActiveState=inactive\n"
+                return "LoadState=not-found\nActiveState=inactive\n"
+            return None
+
+        def fake_run_result(cmd):
+            if cmd[:2] == ["bootctl", "status"]:
+                return (1, "System:\n     Firmware: UEFI\n  Secure Boot: disabled (setup)\n", "")
+            return None
+
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in fake_files),
+            patch("os.path.isdir", side_effect=lambda p: p == "/sys/firmware/efi"),
+            patch("builtins.open", side_effect=fake_open),
+            patch("shutil.which", side_effect=lambda c: f"/usr/bin/{c}" if c in ("systemctl", "bootctl") else None),
+            patch("psutil.process_iter", return_value=[]),
+            patch("glob.glob", return_value=[]),
+            patch.object(audit, "_run", side_effect=fake_run),
+            patch.object(audit, "_run_result", side_effect=fake_run_result),
+        ):
+            report = audit.audit()
+
+        checks = report["checks"]
+        self.assertEqual(checks["Host-based Firewall"], "nftables (Off)")
+        self.assertEqual(checks["UEFI Secure Boot"], "Disabled")
+
+        # Also test non-root /etc/ufw/ufw.conf fallback when ufw status fails.
+        fake_files["/etc/ufw/ufw.conf"] = "# ufw config\nENABLED=no\n"
+        with (
+            patch("os.path.isfile", side_effect=lambda p: p in fake_files),
+            patch("os.path.isdir", return_value=False),
+            patch("builtins.open", side_effect=fake_open),
+            patch("shutil.which", side_effect=lambda c: "/usr/sbin/ufw" if c == "ufw" else None),
+            patch("psutil.process_iter", return_value=[]),
+            patch("glob.glob", return_value=[]),
+            patch.object(audit, "_run", return_value=None),
+        ):
+            ufw_report = audit.audit()
+        self.assertEqual(ufw_report["checks"]["Host-based Firewall"], "UFW (Off)")
+
 
 class TestSuspiciousProxyAudit(unittest.TestCase):
     def test_windows_no_proxy_detected(self):
@@ -1462,6 +1520,115 @@ class TestSummaryReport(unittest.TestCase):
         self.assertIn("2026-11-27 10:35:41", table)
         self.assertIn("MITRE ATT&CK", table)
         self.assertIn("T1055 (Process Anomaly)", table)
+
+        # Linux standalone (Kali-like) + hardened complexity check
+        lin_results = {
+            "endpoint_security": {
+                "platform": "Linux",
+                "hostname": "kalitest",
+                "checks": {
+                    "Mandatory Access Control": "AppArmor (Enabled)",
+                    "Host-based Firewall": "nftables (Off)",
+                    "UEFI Secure Boot": "Disabled",
+                    "Disk Encryption": "Not Detected",
+                },
+            },
+            "domain_settings": {
+                "platform": "Linux",
+                "affiliation": {
+                    "status": "detected",
+                    "value": {"type": "Local (Standalone)", "name": "kalitest"},
+                },
+            },
+            "password_policy": {
+                "settings": {
+                    "minimum_length": {"value": None, "status": "unknown"},
+                    "complexity": {"value": False, "status": "detected"},
+                    "password_required": {"value": True, "status": "detected"},
+                    "lockout_threshold": {"value": None, "status": "unknown"},
+                }
+            },
+        }
+        lin_summary = build_summary_report(lin_results)
+        lin_by_elem = {r["element"]: r for r in lin_summary["rows"]}
+        self.assertEqual(lin_by_elem["Host-based Firewall"]["result"], "Fail")
+        self.assertEqual(lin_by_elem["Host-based Firewall"]["reference"], "nftables")
+        self.assertEqual(lin_by_elem["Boot Security Layer"]["result"], "Fail")
+        self.assertEqual(lin_by_elem["Domain Settings"]["result"], "Pass")
+        self.assertEqual(lin_by_elem["Domain Settings"]["reference"], "Local (Standalone)")
+        self.assertEqual(lin_by_elem["Password Policy"]["result"], "Fail")
+        self.assertEqual(lin_by_elem["Password Policy"]["status"], "Minimal")
+        self.assertEqual(lin_by_elem["Password Policy"]["reference"], "Local (Standalone)")
+
+        # Hardened Linux password policy (PAM pwquality list + faillock) -> Strong / Pass
+        lin_results["password_policy"]["settings"]["minimum_length"] = {"value": 12, "status": "detected"}
+        lin_results["password_policy"]["settings"]["complexity"] = {
+            "value": [{"file": "/etc/pam.d/common-password", "configuration": "password requisite pam_pwquality.so minlen=12"}],
+            "status": "partially_detected",
+        }
+        lin_results["password_policy"]["settings"]["lockout_threshold"] = {"value": 5, "status": "detected"}
+        hardened_summary = build_summary_report(lin_results)
+        hardened_by_elem = {r["element"]: r for r in hardened_summary["rows"]}
+        self.assertEqual(hardened_by_elem["Password Policy"]["result"], "Pass")
+        self.assertEqual(hardened_by_elem["Password Policy"]["status"], "Strong")
+
+    def test_linux_domain_standalone_and_pam_default_policy(self):
+        # 1. DomainAudit Linux standalone (even with Fedora-style 'sss' in nsswitch.conf but no sssd.conf)
+        dom_audit = DomainAudit()
+        dom_audit.system = "Linux"
+        nss_standalone = "passwd: sss files systemd\ngroup: sss files systemd\n"
+        real_open = builtins.open
+
+        def fake_dom_open(path, *args, **kwargs):
+            if path == "/etc/nsswitch.conf":
+                return io.StringIO(nss_standalone)
+            return real_open(path, *args, **kwargs)
+
+        with (
+            patch("shutil.which", return_value=None),
+            patch("os.path.isfile", side_effect=lambda p: p == "/etc/nsswitch.conf"),
+            patch("builtins.open", side_effect=fake_dom_open),
+            patch.object(dom_audit, "_linux_users"),
+            patch.object(dom_audit, "_linux_ntp"),
+        ):
+            dom_report = dom_audit.audit()
+        self.assertEqual(dom_report["affiliation"]["status"], "detected")
+        self.assertEqual(dom_report["affiliation"]["value"]["type"], "Local (Standalone)")
+
+        # 2. PasswordPolicy Linux: default Kali PAM (no pwquality) -> complexity False; inline minlen parsed
+        pwd_audit = PasswordPolicy()
+        pwd_audit.system = "Linux"
+        fake_pam_files = {
+            "/etc/login.defs": "# PASS_MIN_LEN obsolete\nPASS_MAX_DAYS 99999\n",
+            "/etc/pam.d/common-password": "password [success=1 default=ignore] pam_unix.so obscure yescrypt\n",
+        }
+
+        def fake_pwd_open(path, *args, **kwargs):
+            if path in fake_pam_files:
+                return io.StringIO(fake_pam_files[path])
+            raise OSError("not found")
+
+        with (
+            patch("builtins.open", side_effect=fake_pwd_open),
+            patch("glob.glob", return_value=[]),
+            patch("shutil.which", return_value=None),
+        ):
+            kali_pwd = pwd_audit.audit()
+        self.assertIs(kali_pwd["settings"]["complexity"]["value"], False)
+        self.assertEqual(kali_pwd["settings"]["complexity"]["status"], "detected")
+
+        # Inline minlen on pam_pwquality.so
+        fake_pam_files["/etc/pam.d/common-password"] = (
+            "password requisite pam_pwquality.so retry=3 minlen=14\n"
+        )
+        with (
+            patch("builtins.open", side_effect=fake_pwd_open),
+            patch("glob.glob", return_value=[]),
+            patch("shutil.which", return_value=None),
+        ):
+            pwq_pwd = pwd_audit.audit()
+        self.assertEqual(pwq_pwd["settings"]["minimum_length"]["value"], 14)
+        self.assertIsInstance(pwq_pwd["settings"]["complexity"]["value"], list)
 
 
 if __name__ == "__main__":

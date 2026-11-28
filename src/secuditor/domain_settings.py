@@ -847,19 +847,70 @@ class DomainSettingsAudit:
                 "source": "w32tm",
             }
 
+    @staticmethod
+    def _linux_nsswitch_directory():
+        """Detect explicit directory services in /etc/nsswitch.conf (passwd/group)."""
+        try:
+            with open(
+                "/etc/nsswitch.conf", encoding="utf-8", errors="replace"
+            ) as f:
+                for line in f:
+                    cleaned = line.split("#", 1)[0].strip()
+                    if not cleaned or ":" not in cleaned:
+                        continue
+                    db, rest = cleaned.split(":", 1)
+                    if db.strip().lower() not in ("passwd", "group"):
+                        continue
+                    tokens = {t.strip().lower() for t in rest.split()}
+                    if "winbind" in tokens:
+                        return "Winbind"
+                    if "ldap" in tokens or "nslcd" in tokens:
+                        return "LDAP"
+                    if "nis" in tokens or "nisplus" in tokens:
+                        return "NIS"
+        except OSError:
+            pass
+        return None
+
     def _linux_affiliation(self, report):
         # realm list detects configured realm membership when realmd
         # is installed and can access the relevant configuration.
         realm = self._run(["realm", "list"]) if shutil.which("realm") else None
 
         if realm:
+            first_line = next(
+                (ln.strip() for ln in realm.splitlines() if ln.strip()), ""
+            )
             report["affiliation"] = {
                 "status": "detected",
                 "value": {
                     "type": "configured realm",
+                    "name": first_line,
                     "details": realm,
                 },
                 "source": "realm list",
+            }
+        elif os.path.isfile("/etc/ipa/default.conf"):
+            ipa_domain = None
+            try:
+                with open(
+                    "/etc/ipa/default.conf", encoding="utf-8", errors="replace"
+                ) as f:
+                    for line in f:
+                        cleaned = line.split("#", 1)[0].strip()
+                        if cleaned.lower().startswith("domain") and "=" in cleaned:
+                            ipa_domain = cleaned.split("=", 1)[1].strip()
+                            break
+            except OSError:
+                pass
+            report["affiliation"] = {
+                "status": "detected",
+                "value": {
+                    "type": "FreeIPA domain",
+                    "name": ipa_domain or "FreeIPA",
+                    "details": "/etc/ipa/default.conf present",
+                },
+                "source": "/etc/ipa/default.conf",
             }
         elif os.path.isfile("/etc/sssd/sssd.conf"):
             report["affiliation"] = {
@@ -876,20 +927,41 @@ class DomainSettingsAudit:
                 "status": "detected",
                 "value": {
                     "type": "Winbind domain",
+                    "name": domain_name or "",
                     "details": domain_name or "Winbind daemon reachable",
                 },
                 "source": "wbinfo",
             }
         else:
-            report["affiliation"] = {
-                "status": "unknown",
-                "value": None,
-                "source": "realmd",
-            }
-            report["limitations"].append(
-                "No realm, SSSD, or Winbind membership was returned. This "
-                "does not rule out LDAP or other directory integration."
-            )
+            nss_dir = self._linux_nsswitch_directory()
+            if nss_dir:
+                report["affiliation"] = {
+                    "status": "detected",
+                    "value": {
+                        "type": f"{nss_dir} directory",
+                        "details": f"Detected {nss_dir} in /etc/nsswitch.conf",
+                    },
+                    "source": "/etc/nsswitch.conf",
+                }
+            elif os.path.isfile("/etc/nsswitch.conf") or os.path.isfile("/etc/passwd"):
+                report["affiliation"] = {
+                    "status": "detected",
+                    "value": {
+                        "type": "Local (Standalone)",
+                        "name": report.get("hostname") or platform.node(),
+                    },
+                    "source": "/etc/nsswitch.conf",
+                }
+            else:
+                report["affiliation"] = {
+                    "status": "unknown",
+                    "value": None,
+                    "source": "realmd",
+                }
+                report["limitations"].append(
+                    "No realm, SSSD, or Winbind membership was returned. This "
+                    "does not rule out LDAP or other directory integration."
+                )
 
         self._linux_users(report)
         self._linux_ntp(report)
